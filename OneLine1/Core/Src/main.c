@@ -58,8 +58,9 @@ static uint8_t tx_dma_buf[TX_DMA_BUF_SIZE];
 
 static volatile uint16_t tx_dma_len;
 
-/* RX circular-buffer write position, tracked across HT/TC/IDLE events. */
+/* RX circular-buffer positions, tracked across HT/TC/IDLE events and thread mode. */
 static volatile uint16_t rx_old_pos;
+static volatile uint16_t rx_write_pos;
 
 /* Role handles (assigned in USER CODE BEGIN 2). Board 1: RX=LPUART1, TX=USART3. */
 static UART_HandleTypeDef *huart_rx;
@@ -83,8 +84,7 @@ static volatile uint8_t  tx_busy;
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 static uint8_t chunk_is_all_zero(const uint8_t *data, uint16_t len);
-static void bridge_tx_start(const uint8_t *data, uint16_t len);
-static void bridge_rx_chunk(const uint8_t *data, uint16_t len);
+static void bridge_poll_rx(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -146,6 +146,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    bridge_poll_rx();
   }
   /* USER CODE END 3 */
 }
@@ -224,66 +225,108 @@ static uint8_t chunk_is_all_zero(const uint8_t *data, uint16_t len)
   return 1u;
 }
 
-static void bridge_tx_start(const uint8_t *data, uint16_t len)
+static void bridge_poll_rx(void)
 {
+  uint16_t old;
+  uint16_t pos;
+  uint16_t len;
   uint16_t i;
-  uint16_t n;
   uint32_t primask;
-
-  if (len == 0u)
-  {
-    return;
-  }
-
-  n = (len < TX_DMA_BUF_SIZE) ? len : TX_DMA_BUF_SIZE;
 
   primask = __get_PRIMASK();
   __disable_irq();
   if (tx_busy != 0u)
   {
-    drop_cnt += len;
+    __set_PRIMASK(primask);
+    return;
+  }
+  old = rx_old_pos;
+  pos = rx_write_pos;
+  __set_PRIMASK(primask);
+
+  if (pos == old)
+  {
+    return;
+  }
+
+  if (pos > old)
+  {
+    len = (uint16_t)(pos - old);
+  }
+  else
+  {
+    len = (uint16_t)(RX_DMA_BUF_SIZE - old);
+  }
+
+  if (len > TX_DMA_BUF_SIZE)
+  {
+    len = TX_DMA_BUF_SIZE;
+  }
+
+  rx_bytes += len;
+
+#if (DROP_ALL_ZERO_RX_CHUNKS != 0u)
+  if (chunk_is_all_zero(&rx_dma_buf[old], len) != 0u)
+  {
+    zero_burst_cnt++;
+    zero_drop_bytes += len;
+    old = (uint16_t)(old + len);
+    if (old >= RX_DMA_BUF_SIZE)
+    {
+      old = 0u;
+    }
+    primask = __get_PRIMASK();
+    __disable_irq();
+    rx_old_pos = old;
+    if (rx_write_pos >= RX_DMA_BUF_SIZE)
+    {
+      rx_write_pos = 0u;
+    }
+    __set_PRIMASK(primask);
+    return;
+  }
+#endif
+
+  for (i = 0u; i < len; i++)
+  {
+    tx_dma_buf[i] = rx_dma_buf[(uint16_t)(old + i)];
+  }
+
+  primask = __get_PRIMASK();
+  __disable_irq();
+  if (tx_busy != 0u)
+  {
     __set_PRIMASK(primask);
     return;
   }
   tx_busy = 1u;
-  tx_dma_len = n;
+  tx_dma_len = len;
   __set_PRIMASK(primask);
 
-  for (i = 0u; i < n; i++)
-  {
-    tx_dma_buf[i] = data[i];
-  }
-
-  if (len > n)
-  {
-    drop_cnt += (uint16_t)(len - n);
-  }
-
-  if (HAL_UART_Transmit_DMA(huart_tx, tx_dma_buf, n) != HAL_OK)
+  if (HAL_UART_Transmit_DMA(huart_tx, tx_dma_buf, len) != HAL_OK)
   {
     primask = __get_PRIMASK();
     __disable_irq();
     tx_busy = 0u;
     tx_dma_len = 0u;
-    drop_cnt += n;
+    err_cnt++;
     __set_PRIMASK(primask);
-  }
-}
-
-static void bridge_rx_chunk(const uint8_t *data, uint16_t len)
-{
-  rx_bytes += len;
-
-#if (DROP_ALL_ZERO_RX_CHUNKS != 0u)
-  if (chunk_is_all_zero(data, len) != 0u)
-  {
-    zero_burst_cnt++;
-    zero_drop_bytes += len;
     return;
   }
-#endif
 
-  bridge_tx_start(data, len);
+  old = (uint16_t)(old + len);
+  if (old >= RX_DMA_BUF_SIZE)
+  {
+    old = 0u;
+  }
+  primask = __get_PRIMASK();
+  __disable_irq();
+  rx_old_pos = old;
+  if (rx_write_pos >= RX_DMA_BUF_SIZE)
+  {
+    rx_write_pos = 0u;
+  }
+  __set_PRIMASK(primask);
 }
 
 /* RX: HT / TC / IDLE all land here. 'Size' is the ABSOLUTE DMA write position
@@ -294,6 +337,11 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
   {
     HAL_UART_RxEventTypeTypeDef event_type = HAL_UARTEx_GetRxEventType(huart);
     uint16_t pos = Size;
+
+    if (pos > RX_DMA_BUF_SIZE)
+    {
+      pos = 0u;
+    }
 
     if (event_type == HAL_UART_RXEVENT_IDLE)
     {
@@ -308,30 +356,7 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
       rx_event_tc_cnt++;
     }
 
-    if (pos != rx_old_pos)
-    {
-      if (pos > rx_old_pos)
-      {
-        /* Contiguous region: [rx_old_pos, pos) */
-        uint16_t len = (uint16_t)(pos - rx_old_pos);
-        bridge_rx_chunk(&rx_dma_buf[rx_old_pos], len);
-      }
-      else
-      {
-        /* Wrapped: [rx_old_pos, end) then [0, pos) */
-        uint16_t len1 = (uint16_t)(RX_DMA_BUF_SIZE - rx_old_pos);
-        bridge_rx_chunk(&rx_dma_buf[rx_old_pos], len1);
-        if (pos > 0u)
-        {
-          bridge_rx_chunk(&rx_dma_buf[0], pos);
-        }
-      }
-      rx_old_pos = pos;
-      if (rx_old_pos >= RX_DMA_BUF_SIZE)
-      {
-        rx_old_pos = 0u;
-      }
-    }
+    rx_write_pos = pos;
   }
 }
 
@@ -362,6 +387,7 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
     err_cnt++;
     (void)HAL_UART_AbortReceive(huart_rx);
     rx_old_pos = 0u;
+    rx_write_pos = 0u;
     (void)HAL_UARTEx_ReceiveToIdle_DMA(huart_rx, rx_dma_buf, RX_DMA_BUF_SIZE);
   }
   else if (huart == huart_tx)
