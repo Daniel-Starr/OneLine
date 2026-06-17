@@ -46,21 +46,16 @@
 
 /* USER CODE BEGIN PV */
 
-/* ===== OneLine UART bridge (Board 1): software TX FIFO + DMA forwarding ===== */
+/* ===== OneLine UART bridge (Board 1): direct RX chunk -> TX DMA forwarding === */
 #define RX_DMA_BUF_SIZE   256u   /* RX DMA circular buffer (ReceiveToIdle)         */
 #define TX_DMA_BUF_SIZE   256u   /* temp buffer handed to TX DMA per burst         */
-#define TX_FIFO_SIZE      1024u  /* software ring buffer bridging RX -> TX         */
+#define DROP_ALL_ZERO_RX_CHUNKS 1u /* Debug guard for floating/held-low RX lines   */
 
 /* DMA-accessed buffers. STM32U575 is Cortex-M33: no data cache, so no cache
    maintenance / 32-byte alignment is required for DMA coherency. */
 static uint8_t rx_dma_buf[RX_DMA_BUF_SIZE];
 static uint8_t tx_dma_buf[TX_DMA_BUF_SIZE];
 
-/* Software TX ring buffer. Producer: RX event callback. Consumer: tx_kick. */
-static uint8_t  tx_fifo[TX_FIFO_SIZE];
-static volatile uint16_t tx_head;   /* next write index  */
-static volatile uint16_t tx_tail;   /* next read index   */
-static volatile uint16_t tx_count;  /* bytes stored      */
 static volatile uint16_t tx_dma_len;
 
 /* RX circular-buffer write position, tracked across HT/TC/IDLE events. */
@@ -75,6 +70,11 @@ static volatile uint32_t rx_bytes;
 static volatile uint32_t tx_bytes;
 static volatile uint32_t drop_cnt;
 static volatile uint32_t err_cnt;
+static volatile uint32_t zero_burst_cnt;
+static volatile uint32_t zero_drop_bytes;
+static volatile uint32_t rx_event_idle_cnt;
+static volatile uint32_t rx_event_ht_cnt;
+static volatile uint32_t rx_event_tc_cnt;
 static volatile uint8_t  tx_busy;
 
 /* USER CODE END PV */
@@ -82,8 +82,9 @@ static volatile uint8_t  tx_busy;
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-static void fifo_push(const uint8_t *data, uint16_t len);
-static void tx_kick(void);
+static uint8_t chunk_is_all_zero(const uint8_t *data, uint16_t len);
+static void bridge_tx_start(const uint8_t *data, uint16_t len);
+static void bridge_rx_chunk(const uint8_t *data, uint16_t len);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -145,8 +146,6 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    /* Fallback drive: the real work happens in the DMA/UART callbacks. */
-    tx_kick();
   }
   /* USER CODE END 3 */
 }
@@ -207,75 +206,84 @@ void SystemClock_Config(void)
 
 /* USER CODE BEGIN 4 */
 
-/* Push received bytes into the software TX FIFO. Single producer (the RX event
-   callback). When the FIFO is full, extra bytes are dropped and counted. */
-static void fifo_push(const uint8_t *data, uint16_t len)
+static uint8_t chunk_is_all_zero(const uint8_t *data, uint16_t len)
 {
   uint16_t i;
-  uint32_t primask = __get_PRIMASK();
 
-  __disable_irq();
+  if (len == 0u)
+  {
+    return 0u;
+  }
   for (i = 0u; i < len; i++)
   {
-    if (tx_count >= TX_FIFO_SIZE)
+    if (data[i] != 0u)
     {
-      drop_cnt++;                 /* FIFO full: discard the new byte */
-      continue;
+      return 0u;
     }
-    tx_fifo[tx_head] = data[i];
-    tx_head++;
-    if (tx_head >= TX_FIFO_SIZE)
-    {
-      tx_head = 0u;
-    }
-    tx_count++;
   }
-  __set_PRIMASK(primask);
+  return 1u;
 }
 
-/* Start a TX DMA burst when the link is idle and the FIFO holds data. Safe to
-   call from thread mode (the while loop) and from ISR context (TxCplt / RxEvent).
-   tx_busy serializes bursts so a new DMA is never started over a running one. */
-static void tx_kick(void)
+static void bridge_tx_start(const uint8_t *data, uint16_t len)
 {
-  uint16_t n;
   uint16_t i;
-  uint16_t t;
-  uint16_t contiguous;
-  uint32_t primask = __get_PRIMASK();
+  uint16_t n;
+  uint32_t primask;
 
-  __disable_irq();
-  if (tx_busy || (tx_count == 0u))
+  if (len == 0u)
   {
+    return;
+  }
+
+  n = (len < TX_DMA_BUF_SIZE) ? len : TX_DMA_BUF_SIZE;
+
+  primask = __get_PRIMASK();
+  __disable_irq();
+  if (tx_busy != 0u)
+  {
+    drop_cnt += len;
     __set_PRIMASK(primask);
     return;
   }
-  contiguous = (uint16_t)(TX_FIFO_SIZE - tx_tail);
-  if (contiguous > tx_count)
-  {
-    contiguous = tx_count;
-  }
-  n = (contiguous < TX_DMA_BUF_SIZE) ? contiguous : TX_DMA_BUF_SIZE;
-  tx_busy = 1u;                                 /* claim the TX path */
+  tx_busy = 1u;
   tx_dma_len = n;
   __set_PRIMASK(primask);
 
-  /* Copy one contiguous FIFO span. Slots stay reserved until TX completes, so
-     the producer cannot overwrite in-flight data and TX errors can retry it. */
-  t = tx_tail;
   for (i = 0u; i < n; i++)
   {
-    tx_dma_buf[i] = tx_fifo[(uint16_t)(t + i)];
+    tx_dma_buf[i] = data[i];
+  }
+
+  if (len > n)
+  {
+    drop_cnt += (uint16_t)(len - n);
   }
 
   if (HAL_UART_Transmit_DMA(huart_tx, tx_dma_buf, n) != HAL_OK)
   {
     primask = __get_PRIMASK();
     __disable_irq();
-    tx_busy = 0u;                               /* keep data, retry later */
+    tx_busy = 0u;
     tx_dma_len = 0u;
+    drop_cnt += n;
     __set_PRIMASK(primask);
   }
+}
+
+static void bridge_rx_chunk(const uint8_t *data, uint16_t len)
+{
+  rx_bytes += len;
+
+#if (DROP_ALL_ZERO_RX_CHUNKS != 0u)
+  if (chunk_is_all_zero(data, len) != 0u)
+  {
+    zero_burst_cnt++;
+    zero_drop_bytes += len;
+    return;
+  }
+#endif
+
+  bridge_tx_start(data, len);
 }
 
 /* RX: HT / TC / IDLE all land here. 'Size' is the ABSOLUTE DMA write position
@@ -284,7 +292,21 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
   if (huart == huart_rx)
   {
+    HAL_UART_RxEventTypeTypeDef event_type = HAL_UARTEx_GetRxEventType(huart);
     uint16_t pos = Size;
+
+    if (event_type == HAL_UART_RXEVENT_IDLE)
+    {
+      rx_event_idle_cnt++;
+    }
+    else if (event_type == HAL_UART_RXEVENT_HT)
+    {
+      rx_event_ht_cnt++;
+    }
+    else if (event_type == HAL_UART_RXEVENT_TC)
+    {
+      rx_event_tc_cnt++;
+    }
 
     if (pos != rx_old_pos)
     {
@@ -292,19 +314,16 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
       {
         /* Contiguous region: [rx_old_pos, pos) */
         uint16_t len = (uint16_t)(pos - rx_old_pos);
-        rx_bytes += len;
-        fifo_push(&rx_dma_buf[rx_old_pos], len);
+        bridge_rx_chunk(&rx_dma_buf[rx_old_pos], len);
       }
       else
       {
         /* Wrapped: [rx_old_pos, end) then [0, pos) */
         uint16_t len1 = (uint16_t)(RX_DMA_BUF_SIZE - rx_old_pos);
-        rx_bytes += len1;
-        fifo_push(&rx_dma_buf[rx_old_pos], len1);
+        bridge_rx_chunk(&rx_dma_buf[rx_old_pos], len1);
         if (pos > 0u)
         {
-          rx_bytes += pos;
-          fifo_push(&rx_dma_buf[0], pos);
+          bridge_rx_chunk(&rx_dma_buf[0], pos);
         }
       }
       rx_old_pos = pos;
@@ -313,11 +332,10 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
         rx_old_pos = 0u;
       }
     }
-    tx_kick();
   }
 }
 
-/* TX DMA burst finished: release the claim and continue with the next chunk. */
+/* TX DMA burst finished: release the claim. New RX chunks start fresh DMA sends. */
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 {
   if (huart == huart_tx)
@@ -327,21 +345,10 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 
     __disable_irq();
     n = tx_dma_len;
-    if (n > tx_count)
-    {
-      n = tx_count;
-    }
-    tx_tail = (uint16_t)(tx_tail + n);
-    if (tx_tail >= TX_FIFO_SIZE)
-    {
-      tx_tail = (uint16_t)(tx_tail - TX_FIFO_SIZE);
-    }
-    tx_count = (uint16_t)(tx_count - n);
     tx_dma_len = 0u;
     tx_busy = 0u;
     tx_bytes += n;
     __set_PRIMASK(primask);
-    tx_kick();
   }
 }
 
