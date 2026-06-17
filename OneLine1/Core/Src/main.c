@@ -230,6 +230,7 @@ static void bridge_poll_rx(void)
   uint16_t old;
   uint16_t pos;
   uint16_t len;
+  uint16_t new_old;
   uint16_t i;
   uint32_t primask;
 
@@ -242,10 +243,13 @@ static void bridge_poll_rx(void)
   }
   old = rx_old_pos;
   pos = rx_write_pos;
-  __set_PRIMASK(primask);
-
+  if (pos > RX_DMA_BUF_SIZE)
+  {
+    pos = 0u;
+  }
   if (pos == old)
   {
+    __set_PRIMASK(primask);
     return;
   }
 
@@ -262,6 +266,9 @@ static void bridge_poll_rx(void)
   {
     len = TX_DMA_BUF_SIZE;
   }
+  tx_busy = 1u;
+  tx_dma_len = len;
+  __set_PRIMASK(primask);
 
   rx_bytes += len;
 
@@ -270,14 +277,16 @@ static void bridge_poll_rx(void)
   {
     zero_burst_cnt++;
     zero_drop_bytes += len;
-    old = (uint16_t)(old + len);
-    if (old >= RX_DMA_BUF_SIZE)
+    new_old = (uint16_t)(old + len);
+    if (new_old >= RX_DMA_BUF_SIZE)
     {
-      old = 0u;
+      new_old = 0u;
     }
     primask = __get_PRIMASK();
     __disable_irq();
-    rx_old_pos = old;
+    rx_old_pos = new_old;
+    tx_busy = 0u;
+    tx_dma_len = 0u;
     if (rx_write_pos >= RX_DMA_BUF_SIZE)
     {
       rx_write_pos = 0u;
@@ -292,41 +301,31 @@ static void bridge_poll_rx(void)
     tx_dma_buf[i] = rx_dma_buf[(uint16_t)(old + i)];
   }
 
+  new_old = (uint16_t)(old + len);
+  if (new_old >= RX_DMA_BUF_SIZE)
+  {
+    new_old = 0u;
+  }
   primask = __get_PRIMASK();
   __disable_irq();
-  if (tx_busy != 0u)
+  rx_old_pos = new_old;
+  if (rx_write_pos >= RX_DMA_BUF_SIZE)
   {
-    __set_PRIMASK(primask);
-    return;
+    rx_write_pos = 0u;
   }
-  tx_busy = 1u;
-  tx_dma_len = len;
   __set_PRIMASK(primask);
 
   if (HAL_UART_Transmit_DMA(huart_tx, tx_dma_buf, len) != HAL_OK)
   {
     primask = __get_PRIMASK();
     __disable_irq();
+    rx_old_pos = old;
     tx_busy = 0u;
     tx_dma_len = 0u;
     err_cnt++;
     __set_PRIMASK(primask);
     return;
   }
-
-  old = (uint16_t)(old + len);
-  if (old >= RX_DMA_BUF_SIZE)
-  {
-    old = 0u;
-  }
-  primask = __get_PRIMASK();
-  __disable_irq();
-  rx_old_pos = old;
-  if (rx_write_pos >= RX_DMA_BUF_SIZE)
-  {
-    rx_write_pos = 0u;
-  }
-  __set_PRIMASK(primask);
 }
 
 /* RX: HT / TC / IDLE all land here. 'Size' is the ABSOLUTE DMA write position
@@ -357,6 +356,7 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
     }
 
     rx_write_pos = pos;
+    bridge_poll_rx();
   }
 }
 
@@ -374,6 +374,7 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
     tx_busy = 0u;
     tx_bytes += n;
     __set_PRIMASK(primask);
+    bridge_poll_rx();
   }
 }
 
