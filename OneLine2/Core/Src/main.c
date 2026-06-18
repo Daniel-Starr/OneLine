@@ -46,41 +46,51 @@
 
 /* USER CODE BEGIN PV */
 
-/* ===== OneLine UART bridge (Board 2): direct RX chunk -> TX DMA forwarding === */
-#define RX_DMA_BUF_SIZE   256u   /* RX DMA circular buffer (ReceiveToIdle)         */
-#define TX_DMA_BUF_SIZE   256u   /* temp buffer handed to TX DMA per burst         */
+/* ===== OneLine UART bridge (Board 2): nonblocking, backpressure-safe forward ===
+   USART3_RX (fast, 921600) -> TX FIFO -> LPUART1_TX (slow, 115200) -> PC.
+   The TX FIFO absorbs the rate mismatch; when it fills, new data is dropped
+   (drop_cnt). Slow is allowed; the data path must never block/deadlock. */
+#define RX_DMA_BUF_SIZE   256u   /* USART3_RX DMA circular buffer (ReceiveToIdle)  */
+#define TX_DMA_BUF_SIZE   256u   /* staging buffer for one LPUART1_TX DMA burst    */
+#define TX_FIFO_SIZE      4096u  /* software TX FIFO: absorbs RX>TX rate mismatch  */
 
-/* DMA-accessed buffers. STM32U575 is Cortex-M33: no data cache, so no cache
-   maintenance / 32-byte alignment is required for DMA coherency. */
+/* DMA-accessed buffers. STM32U575 is Cortex-M33: no data cache, so DMA needs no
+   cache maintenance / 32-byte alignment for coherency. */
 static uint8_t rx_dma_buf[RX_DMA_BUF_SIZE];
 static uint8_t tx_dma_buf[TX_DMA_BUF_SIZE];
 
+/* RX side: USART3_RX. Positions tracked across HT/TC/IDLE events. */
+static UART_HandleTypeDef *huart_rx;      /* = &huart3   */
+static volatile uint16_t rx_old_pos;      /* drained up to here (bridge_poll)   */
+static volatile uint16_t rx_write_pos;    /* latest DMA write position (Size)   */
+
+/* TX side: LPUART1_TX + software FIFO. FIFO is touched only by the main loop. */
+static UART_HandleTypeDef *huart_tx;      /* = &hlpuart1 */
+static uint8_t  tx_fifo[TX_FIFO_SIZE];
+static volatile uint16_t tx_head;
+static volatile uint16_t tx_tail;
+static volatile uint16_t tx_count;
 static volatile uint16_t tx_dma_len;
-
-/* RX circular-buffer positions, tracked across HT/TC/IDLE events and thread mode. */
-static volatile uint16_t rx_old_pos;
-static volatile uint16_t rx_write_pos;
-
-/* Role handles (assigned in USER CODE BEGIN 2). Board 2: RX=USART3, TX=LPUART1. */
-static UART_HandleTypeDef *huart_rx;
-static UART_HandleTypeDef *huart_tx;
+static volatile uint8_t  tx_busy;
 
 /* Debug counters (inspect live in the debugger). */
 static volatile uint32_t rx_bytes;
 static volatile uint32_t tx_bytes;
-static volatile uint32_t drop_cnt;
+static volatile uint32_t drop_cnt;        /* bytes dropped because TX FIFO full  */
 static volatile uint32_t err_cnt;
+static volatile uint32_t tx_err_cnt;
 static volatile uint32_t rx_event_idle_cnt;
 static volatile uint32_t rx_event_ht_cnt;
 static volatile uint32_t rx_event_tc_cnt;
-static volatile uint8_t  tx_busy;
 
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-static void bridge_poll_rx(void);
+static void fifo_push(const uint8_t *data, uint16_t len);
+static void tx_kick(void);
+static void bridge_poll(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -142,7 +152,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    bridge_poll_rx();
+    bridge_poll();
   }
   /* USER CODE END 3 */
 }
@@ -203,92 +213,131 @@ void SystemClock_Config(void)
 
 /* USER CODE BEGIN 4 */
 
-static void bridge_poll_rx(void)
+/* Push received bytes into the software TX FIFO. The FIFO is produced and consumed
+   only by the main loop (bridge_poll / tx_kick), so no critical section is needed
+   here. When the FIFO is full, new bytes are dropped - never block. */
+static void fifo_push(const uint8_t *data, uint16_t len)
 {
-  uint16_t old;
-  uint16_t pos;
-  uint16_t len;
-  uint16_t new_old;
   uint16_t i;
+
+  for (i = 0u; i < len; i++)
+  {
+    if (tx_count >= TX_FIFO_SIZE)
+    {
+      drop_cnt++;                  /* FIFO full: drop new data (loss ok, stall not) */
+      continue;
+    }
+    tx_fifo[tx_head] = data[i];
+    tx_head++;
+    if (tx_head >= TX_FIFO_SIZE)
+    {
+      tx_head = 0u;
+    }
+    tx_count++;
+  }
+}
+
+/* Start one LPUART1_TX DMA burst (<= 256 bytes) from the FIFO when TX is idle.
+   Called only from the main loop. Never waits on tx_busy - returns immediately if
+   a burst is already in flight (no blocking, no spin). */
+static void tx_kick(void)
+{
+  uint16_t n;
+  uint16_t i;
+  uint16_t t;
   uint32_t primask;
 
+  /* Claim the TX path. tx_busy is also cleared by the TX ISRs, so guard the test. */
   primask = __get_PRIMASK();
   __disable_irq();
-  if (tx_busy != 0u)
+  if (tx_busy || (tx_count == 0u))
   {
     __set_PRIMASK(primask);
     return;
   }
-  old = rx_old_pos;
+  tx_busy = 1u;
+  __set_PRIMASK(primask);
+
+  n = (tx_count < TX_DMA_BUF_SIZE) ? tx_count : TX_DMA_BUF_SIZE;
+  tx_dma_len = n;
+
+  t = tx_tail;
+  for (i = 0u; i < n; i++)
+  {
+    tx_dma_buf[i] = tx_fifo[t];
+    t++;
+    if (t >= TX_FIFO_SIZE)
+    {
+      t = 0u;
+    }
+  }
+
+  if (HAL_UART_Transmit_DMA(huart_tx, tx_dma_buf, n) == HAL_OK)
+  {
+    tx_tail = t;                                  /* commit consumption */
+    tx_count = (uint16_t)(tx_count - n);
+  }
+  else
+  {
+    tx_dma_len = 0u;                              /* start failed: keep FIFO data */
+    primask = __get_PRIMASK();
+    __disable_irq();
+    tx_busy = 0u;
+    __set_PRIMASK(primask);
+  }
+}
+
+/* Main-loop pump: drain the USART3_RX DMA ring into the TX FIFO, then kick TX.
+   The byte copying lives here (thread mode), never in an ISR, so the RX->TX path
+   cannot block. 'rx_write_pos' is the ABSOLUTE DMA write position (0..RX_DMA_BUF_SIZE)
+   recorded by the RX-event ISR. */
+static void bridge_poll(void)
+{
+  uint16_t old;
+  uint16_t pos;
+
   pos = rx_write_pos;
   if (pos > RX_DMA_BUF_SIZE)
   {
     pos = 0u;
   }
-  if (pos == old)
+  old = rx_old_pos;
+
+  if (pos != old)
   {
-    __set_PRIMASK(primask);
-    return;
+    if (pos > old)
+    {
+      uint16_t len = (uint16_t)(pos - old);            /* contiguous [old, pos) */
+      rx_bytes += len;
+      fifo_push(&rx_dma_buf[old], len);
+    }
+    else
+    {
+      if (old < RX_DMA_BUF_SIZE)                        /* tail [old, end)       */
+      {
+        uint16_t len1 = (uint16_t)(RX_DMA_BUF_SIZE - old);
+        rx_bytes += len1;
+        fifo_push(&rx_dma_buf[old], len1);
+      }
+      if (pos > 0u)                                     /* head [0, pos)         */
+      {
+        rx_bytes += pos;
+        fifo_push(&rx_dma_buf[0], pos);
+      }
+    }
+    rx_old_pos = pos;
   }
 
-  if (pos > old)
-  {
-    len = (uint16_t)(pos - old);
-  }
-  else
-  {
-    len = (uint16_t)(RX_DMA_BUF_SIZE - old);
-  }
-
-  if (len > TX_DMA_BUF_SIZE)
-  {
-    len = TX_DMA_BUF_SIZE;
-  }
-  tx_busy = 1u;
-  tx_dma_len = len;
-  __set_PRIMASK(primask);
-
-  rx_bytes += len;
-
-  for (i = 0u; i < len; i++)
-  {
-    tx_dma_buf[i] = rx_dma_buf[(uint16_t)(old + i)];
-  }
-
-  new_old = (uint16_t)(old + len);
-  if (new_old >= RX_DMA_BUF_SIZE)
-  {
-    new_old = 0u;
-  }
-  primask = __get_PRIMASK();
-  __disable_irq();
-  rx_old_pos = new_old;
-  if (rx_write_pos >= RX_DMA_BUF_SIZE)
-  {
-    rx_write_pos = 0u;
-  }
-  __set_PRIMASK(primask);
-
-  if (HAL_UART_Transmit_DMA(huart_tx, tx_dma_buf, len) != HAL_OK)
-  {
-    primask = __get_PRIMASK();
-    __disable_irq();
-    rx_old_pos = old;
-    tx_busy = 0u;
-    tx_dma_len = 0u;
-    err_cnt++;
-    __set_PRIMASK(primask);
-    return;
-  }
+  tx_kick();
 }
 
-/* RX: HT / TC / IDLE all land here. 'Size' is the ABSOLUTE DMA write position
-   inside the circular buffer (0..RX_DMA_BUF_SIZE), not this chunk's length. */
+/* RX: HT / TC / IDLE land here. Minimal by design - only record the DMA write
+   position and event counters. The copy is done by bridge_poll() in the main loop.
+   Never re-arm ReceiveToIdle here (the circular DMA keeps running). */
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
   if (huart == huart_rx)
   {
-    HAL_UART_RxEventTypeTypeDef event_type = HAL_UARTEx_GetRxEventType(huart);
     uint16_t pos = Size;
 
     if (pos > RX_DMA_BUF_SIZE)
@@ -296,45 +345,33 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
       pos = 0u;
     }
 
-    if (event_type == HAL_UART_RXEVENT_IDLE)
+    switch (HAL_UARTEx_GetRxEventType(huart))
     {
-      rx_event_idle_cnt++;
-    }
-    else if (event_type == HAL_UART_RXEVENT_HT)
-    {
-      rx_event_ht_cnt++;
-    }
-    else if (event_type == HAL_UART_RXEVENT_TC)
-    {
-      rx_event_tc_cnt++;
+      case HAL_UART_RXEVENT_IDLE: rx_event_idle_cnt++; break;
+      case HAL_UART_RXEVENT_HT:   rx_event_ht_cnt++;   break;
+      case HAL_UART_RXEVENT_TC:   rx_event_tc_cnt++;   break;
+      default: break;
     }
 
     rx_write_pos = pos;
-    bridge_poll_rx();
   }
 }
 
-/* TX DMA burst finished: release the claim. New RX chunks start fresh DMA sends. */
+/* TX burst finished: only release the claim and count bytes. Do NOT kick here -
+   the next bridge_poll() iteration in the main loop starts the following burst. */
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 {
   if (huart == huart_tx)
   {
-    uint16_t n;
-    uint32_t primask = __get_PRIMASK();
-
-    __disable_irq();
-    n = tx_dma_len;
+    tx_bytes += tx_dma_len;
     tx_dma_len = 0u;
     tx_busy = 0u;
-    tx_bytes += n;
-    __set_PRIMASK(primask);
-    bridge_poll_rx();
   }
 }
 
-/* "DMA on RX Error" is Enabled in CubeMX, so an overrun (ORE) stops the RX DMA.
-   Abort and restart ReceiveToIdle and reset the position tracker, otherwise the
-   RX path stalls permanently. */
+/* RX error (e.g. ORE stops the DMA): synchronous abort + restart ReceiveToIdle and
+   reset positions. TX error: just release the claim; bridge_poll() resumes on the
+   next iteration. No long work in either branch. */
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
   if (huart == huart_rx)
@@ -347,14 +384,9 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
   }
   else if (huart == huart_tx)
   {
-    /* Release the TX claim so a TX-side error cannot stall forwarding forever. */
-    uint32_t primask = __get_PRIMASK();
-
-    err_cnt++;
-    __disable_irq();
+    tx_err_cnt++;
     tx_busy = 0u;
     tx_dma_len = 0u;
-    __set_PRIMASK(primask);
   }
 }
 
