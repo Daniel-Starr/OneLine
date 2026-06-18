@@ -49,7 +49,6 @@
 /* ===== OneLine UART bridge (Board 2): direct RX chunk -> TX DMA forwarding === */
 #define RX_DMA_BUF_SIZE   256u   /* RX DMA circular buffer (ReceiveToIdle)         */
 #define TX_DMA_BUF_SIZE   256u   /* temp buffer handed to TX DMA per burst         */
-#define DROP_ALL_ZERO_RX_CHUNKS 1u /* Debug guard for floating/held-low RX lines   */
 
 /* DMA-accessed buffers. STM32U575 is Cortex-M33: no data cache, so no cache
    maintenance / 32-byte alignment is required for DMA coherency. */
@@ -71,8 +70,6 @@ static volatile uint32_t rx_bytes;
 static volatile uint32_t tx_bytes;
 static volatile uint32_t drop_cnt;
 static volatile uint32_t err_cnt;
-static volatile uint32_t zero_burst_cnt;
-static volatile uint32_t zero_drop_bytes;
 static volatile uint32_t rx_event_idle_cnt;
 static volatile uint32_t rx_event_ht_cnt;
 static volatile uint32_t rx_event_tc_cnt;
@@ -83,7 +80,6 @@ static volatile uint8_t  tx_busy;
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-static uint8_t chunk_is_all_zero(const uint8_t *data, uint16_t len);
 static void bridge_poll_rx(void);
 /* USER CODE END PFP */
 
@@ -207,24 +203,6 @@ void SystemClock_Config(void)
 
 /* USER CODE BEGIN 4 */
 
-static uint8_t chunk_is_all_zero(const uint8_t *data, uint16_t len)
-{
-  uint16_t i;
-
-  if (len == 0u)
-  {
-    return 0u;
-  }
-  for (i = 0u; i < len; i++)
-  {
-    if (data[i] != 0u)
-    {
-      return 0u;
-    }
-  }
-  return 1u;
-}
-
 static void bridge_poll_rx(void)
 {
   uint16_t old;
@@ -271,30 +249,6 @@ static void bridge_poll_rx(void)
   __set_PRIMASK(primask);
 
   rx_bytes += len;
-
-#if (DROP_ALL_ZERO_RX_CHUNKS != 0u)
-  if (chunk_is_all_zero(&rx_dma_buf[old], len) != 0u)
-  {
-    zero_burst_cnt++;
-    zero_drop_bytes += len;
-    new_old = (uint16_t)(old + len);
-    if (new_old >= RX_DMA_BUF_SIZE)
-    {
-      new_old = 0u;
-    }
-    primask = __get_PRIMASK();
-    __disable_irq();
-    rx_old_pos = new_old;
-    tx_busy = 0u;
-    tx_dma_len = 0u;
-    if (rx_write_pos >= RX_DMA_BUF_SIZE)
-    {
-      rx_write_pos = 0u;
-    }
-    __set_PRIMASK(primask);
-    return;
-  }
-#endif
 
   for (i = 0u; i < len; i++)
   {
