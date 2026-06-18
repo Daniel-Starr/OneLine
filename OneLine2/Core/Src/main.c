@@ -53,6 +53,7 @@
 #define RX_DMA_BUF_SIZE   256u   /* USART3_RX DMA circular buffer (ReceiveToIdle)  */
 #define TX_DMA_BUF_SIZE   256u   /* staging buffer for one LPUART1_TX DMA burst    */
 #define TX_FIFO_SIZE      4096u  /* software TX FIFO: absorbs RX>TX rate mismatch  */
+#define DROP_ALL_ZERO_RX_CHUNKS 1u /* 1 = drop all-0x00 chunks (board-1 reset noise) */
 
 /* DMA-accessed buffers. STM32U575 is Cortex-M33: no data cache, so DMA needs no
    cache maintenance / 32-byte alignment for coherency. */
@@ -77,6 +78,8 @@ static volatile uint8_t  tx_busy;
 static volatile uint32_t rx_bytes;
 static volatile uint32_t tx_bytes;
 static volatile uint32_t drop_cnt;        /* bytes dropped because TX FIFO full  */
+static volatile uint32_t zero_burst_cnt;  /* all-0x00 chunks dropped (reset noise)*/
+static volatile uint32_t zero_drop_bytes; /* total bytes in dropped 0x00 chunks  */
 static volatile uint32_t err_cnt;
 static volatile uint32_t tx_err_cnt;
 static volatile uint32_t rx_event_idle_cnt;
@@ -90,6 +93,8 @@ void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 static void fifo_push(const uint8_t *data, uint16_t len);
 static void tx_kick(void);
+static uint8_t chunk_is_all_zero(const uint8_t *data, uint16_t len);
+static void forward_chunk(const uint8_t *data, uint16_t len);
 static void bridge_poll(void);
 /* USER CODE END PFP */
 
@@ -287,10 +292,50 @@ static void tx_kick(void)
   }
 }
 
-/* Main-loop pump: drain the USART3_RX DMA ring into the TX FIFO, then kick TX.
-   The byte copying lives here (thread mode), never in an ISR, so the RX->TX path
-   cannot block. 'rx_write_pos' is the ABSOLUTE DMA write position (0..RX_DMA_BUF_SIZE)
-   recorded by the RX-event ISR. */
+/* Return 1 if the chunk is non-empty and every byte is 0x00. Used to detect the
+   0x00 flood a board-1 reset produces on the USART3 RX line. */
+static uint8_t chunk_is_all_zero(const uint8_t *data, uint16_t len)
+{
+  uint16_t i;
+
+  if (len == 0u)
+  {
+    return 0u;
+  }
+  for (i = 0u; i < len; i++)
+  {
+    if (data[i] != 0u)
+    {
+      return 0u;
+    }
+  }
+  return 1u;
+}
+
+/* Forward one contiguous RX chunk into the TX FIFO. When DROP_ALL_ZERO_RX_CHUNKS
+   is set, a fully-0x00 chunk is counted and dropped (not forwarded) so a board-1
+   reset cannot flood the downstream link. Never blocks; rx_old_pos still advances
+   in bridge_poll() either way. */
+static void forward_chunk(const uint8_t *data, uint16_t len)
+{
+  rx_bytes += len;
+
+#if (DROP_ALL_ZERO_RX_CHUNKS != 0u)
+  if (chunk_is_all_zero(data, len) != 0u)
+  {
+    zero_burst_cnt++;
+    zero_drop_bytes += len;
+    return;                        /* drop reset noise, do NOT write the FIFO */
+  }
+#endif
+
+  fifo_push(data, len);
+}
+
+/* Main-loop pump: drain the USART3_RX DMA ring into the TX FIFO (via forward_chunk,
+   which filters all-0x00 chunks), then kick TX. The byte copying lives here (thread
+   mode), never in an ISR, so the RX->TX path cannot block. 'rx_write_pos' is the
+   ABSOLUTE DMA write position (0..RX_DMA_BUF_SIZE) recorded by the RX-event ISR. */
 static void bridge_poll(void)
 {
   uint16_t old;
@@ -307,22 +352,17 @@ static void bridge_poll(void)
   {
     if (pos > old)
     {
-      uint16_t len = (uint16_t)(pos - old);            /* contiguous [old, pos) */
-      rx_bytes += len;
-      fifo_push(&rx_dma_buf[old], len);
+      forward_chunk(&rx_dma_buf[old], (uint16_t)(pos - old));            /* [old,pos) */
     }
     else
     {
-      if (old < RX_DMA_BUF_SIZE)                        /* tail [old, end)       */
+      if (old < RX_DMA_BUF_SIZE)
       {
-        uint16_t len1 = (uint16_t)(RX_DMA_BUF_SIZE - old);
-        rx_bytes += len1;
-        fifo_push(&rx_dma_buf[old], len1);
+        forward_chunk(&rx_dma_buf[old], (uint16_t)(RX_DMA_BUF_SIZE - old)); /* tail   */
       }
-      if (pos > 0u)                                     /* head [0, pos)         */
+      if (pos > 0u)
       {
-        rx_bytes += pos;
-        fifo_push(&rx_dma_buf[0], pos);
+        forward_chunk(&rx_dma_buf[0], pos);                             /* head [0,pos) */
       }
     }
     rx_old_pos = pos;
