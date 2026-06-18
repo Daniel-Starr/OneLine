@@ -124,6 +124,8 @@ int main(void)
   MX_GPDMA1_Init();
   MX_LPUART1_UART_Init();
   MX_USART3_UART_Init();
+  MX_UART4_Init();
+  MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
 
   /* Board 1 link: PC -> LPUART1(RX) -> USART3(TX) -> Board 2 */
