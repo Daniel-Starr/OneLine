@@ -51,6 +51,12 @@
 #define TX_DMA_BUF_SIZE   256u   /* staging buffer for one USART3_TX DMA burst      */
 #define TX_FIFO_SIZE      4096u  /* shared TX software FIFO (3 RX merge into 1 TX)  */
 
+/* Current hardware bring-up uses only LPUART1_RX on board 1. Keep the unused
+   USART1/UART4 RX paths disabled so floating inputs cannot inject noise. */
+#define ENABLE_RX_USART1  0u
+#define ENABLE_RX_UART4   0u
+#define ENABLE_RX_LPUART1 1u
+
 /* One receive port: its own UART, circular DMA buffer, positions and counters. */
 typedef struct
 {
@@ -140,27 +146,33 @@ int main(void)
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
 
-  /* Board 1 link: USART1_RX / UART4_RX / LPUART1_RX -> USART3_TX -> Board 2 */
+  /* Board 1 link: enabled RX port(s) -> USART3_TX -> Board 2 */
   huart_tx         = &huart3;
   rx_usart1.huart  = &huart1;
   rx_uart4.huart   = &huart4;
   rx_lpuart1.huart = &hlpuart1;
 
-  /* Start all three RX ports: ReceiveToIdle over circular DMA. HT/TC/IDLE events
+  /* Start enabled RX ports: ReceiveToIdle over circular DMA. HT/TC/IDLE events
      all arrive in HAL_UARTEx_RxEventCallback. Keep HT enabled; never re-arm inside
      that callback (the circular DMA keeps running). */
+#if (ENABLE_RX_USART1 != 0u)
   if (HAL_UARTEx_ReceiveToIdle_DMA(rx_usart1.huart,  rx_usart1.buf,  RX_BUF_SIZE) != HAL_OK)
   {
     Error_Handler();
   }
+#endif
+#if (ENABLE_RX_UART4 != 0u)
   if (HAL_UARTEx_ReceiveToIdle_DMA(rx_uart4.huart,   rx_uart4.buf,   RX_BUF_SIZE) != HAL_OK)
   {
     Error_Handler();
   }
+#endif
+#if (ENABLE_RX_LPUART1 != 0u)
   if (HAL_UARTEx_ReceiveToIdle_DMA(rx_lpuart1.huart, rx_lpuart1.buf, RX_BUF_SIZE) != HAL_OK)
   {
     Error_Handler();
   }
+#endif
 
   /* USER CODE END 2 */
 
@@ -315,19 +327,27 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
   uint16_t pos;
   uint16_t old;
 
+#if (ENABLE_RX_USART1 != 0u)
   if (huart == rx_usart1.huart)
   {
     p = &rx_usart1;
   }
-  else if (huart == rx_uart4.huart)
+  else
+#endif
+#if (ENABLE_RX_UART4 != 0u)
+  if (huart == rx_uart4.huart)
   {
     p = &rx_uart4;
   }
-  else if (huart == rx_lpuart1.huart)
+  else
+#endif
+#if (ENABLE_RX_LPUART1 != 0u)
+  if (huart == rx_lpuart1.huart)
   {
     p = &rx_lpuart1;
   }
   else
+#endif
   {
     return;
   }
@@ -400,19 +420,27 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
   RxPort_t *p;
 
+#if (ENABLE_RX_USART1 != 0u)
   if (huart == rx_usart1.huart)
   {
     p = &rx_usart1;
   }
-  else if (huart == rx_uart4.huart)
+  else
+#endif
+#if (ENABLE_RX_UART4 != 0u)
+  if (huart == rx_uart4.huart)
   {
     p = &rx_uart4;
   }
-  else if (huart == rx_lpuart1.huart)
+  else
+#endif
+#if (ENABLE_RX_LPUART1 != 0u)
+  if (huart == rx_lpuart1.huart)
   {
     p = &rx_lpuart1;
   }
   else
+#endif
   {
     p = NULL;
   }
