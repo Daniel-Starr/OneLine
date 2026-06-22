@@ -46,44 +46,23 @@
 
 /* USER CODE BEGIN PV */
 
-/* ===== OneLine UART bridge (Board 2): nonblocking, backpressure-safe forward ===
-   USART3_RX (fast, 921600) -> TX FIFO -> LPUART1_TX (slow, 115200) -> PC.
-   The TX FIFO absorbs the rate mismatch; when it fills, new data is dropped
-   (drop_cnt). Slow is allowed; the data path must never block/deadlock. */
-#define RX_DMA_BUF_SIZE   256u   /* USART3_RX DMA circular buffer (ReceiveToIdle)  */
-#define TX_DMA_BUF_SIZE   256u   /* staging buffer for one LPUART1_TX DMA burst    */
-#define TX_FIFO_SIZE      4096u  /* software TX FIFO: absorbs RX>TX rate mismatch  */
-#define DROP_ALL_ZERO_RX_CHUNKS 1u /* 1 = drop all-0x00 chunks (board-1 reset noise) */
+/* Board 2 direct bridge: USART3_RX -> LPUART1_TX.
+   ReceiveToIdle uses normal DMA. When a frame arrives, the RX callback copies it
+   into a static TX buffer and starts LPUART1 TX DMA immediately. */
+#define BRIDGE_BUF_SIZE 256u
 
-/* DMA-accessed buffers. STM32U575 is Cortex-M33: no data cache, so DMA needs no
-   cache maintenance / 32-byte alignment for coherency. */
-static uint8_t rx_dma_buf[RX_DMA_BUF_SIZE];
-static uint8_t tx_dma_buf[TX_DMA_BUF_SIZE];
+static uint8_t usart3_rx_buf[BRIDGE_BUF_SIZE];
+static uint8_t lpuart1_tx_buf[BRIDGE_BUF_SIZE];
 
-/* RX side: USART3_RX. Positions tracked across HT/TC/IDLE events. */
-static UART_HandleTypeDef *huart_rx;      /* = &huart3   */
-static volatile uint16_t rx_old_pos;      /* drained up to here (bridge_poll)   */
-static volatile uint16_t rx_write_pos;    /* latest DMA write position (Size)   */
-
-/* TX side: LPUART1_TX + software FIFO. FIFO is touched only by the main loop. */
-static UART_HandleTypeDef *huart_tx;      /* = &hlpuart1 */
-static uint8_t  tx_fifo[TX_FIFO_SIZE];
-static volatile uint16_t tx_head;
-static volatile uint16_t tx_tail;
-static volatile uint16_t tx_count;
 static volatile uint16_t tx_dma_len;
 static volatile uint8_t  tx_busy;
 
-/* Debug counters (inspect live in the debugger). */
 static volatile uint32_t rx_bytes;
 static volatile uint32_t tx_bytes;
-static volatile uint32_t drop_cnt;        /* bytes dropped because TX FIFO full  */
-static volatile uint32_t zero_burst_cnt;  /* all-0x00 chunks dropped (reset noise)*/
-static volatile uint32_t zero_drop_bytes; /* total bytes in dropped 0x00 chunks  */
+static volatile uint32_t drop_cnt;
 static volatile uint32_t err_cnt;
 static volatile uint32_t tx_err_cnt;
 static volatile uint32_t rx_event_idle_cnt;
-static volatile uint32_t rx_event_ht_cnt;
 static volatile uint32_t rx_event_tc_cnt;
 
 /* USER CODE END PV */
@@ -91,11 +70,8 @@ static volatile uint32_t rx_event_tc_cnt;
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-static void fifo_push(const uint8_t *data, uint16_t len);
-static void tx_kick(void);
-static uint8_t chunk_is_all_zero(const uint8_t *data, uint16_t len);
-static void forward_chunk(const uint8_t *data, uint16_t len);
-static void bridge_poll(void);
+static void bridge_rx_start(void);
+static void bridge_send_to_lpuart1(const uint8_t *data, uint16_t len);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -137,16 +113,8 @@ int main(void)
   MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
 
-  /* Board 2 link: Board 1 -> USART3(RX) -> LPUART1(TX) -> PC */
-  huart_rx = &huart3;
-  huart_tx = &hlpuart1;
-
-  /* Start the RX side: ReceiveToIdle over circular DMA. HT/TC/IDLE events all
-     arrive in HAL_UARTEx_RxEventCallback. Keep HT enabled (do not disable it). */
-  if (HAL_UARTEx_ReceiveToIdle_DMA(huart_rx, rx_dma_buf, RX_DMA_BUF_SIZE) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  /* Board 2 minimal link: USART3_RX -> LPUART1_TX -> PC. */
+  bridge_rx_start();
 
   /* USER CODE END 2 */
 
@@ -157,7 +125,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    bridge_poll();
+    __NOP();
   }
   /* USER CODE END 3 */
 }
@@ -218,190 +186,89 @@ void SystemClock_Config(void)
 
 /* USER CODE BEGIN 4 */
 
-/* Push received bytes into the software TX FIFO. The FIFO is produced and consumed
-   only by the main loop (bridge_poll / tx_kick), so no critical section is needed
-   here. When the FIFO is full, new bytes are dropped - never block. */
-static void fifo_push(const uint8_t *data, uint16_t len)
+static void bridge_rx_start(void)
 {
-  uint16_t i;
-
-  for (i = 0u; i < len; i++)
+  if (HAL_UARTEx_ReceiveToIdle_DMA(&huart3, usart3_rx_buf, BRIDGE_BUF_SIZE) != HAL_OK)
   {
-    if (tx_count >= TX_FIFO_SIZE)
-    {
-      drop_cnt++;                  /* FIFO full: drop new data (loss ok, stall not) */
-      continue;
-    }
-    tx_fifo[tx_head] = data[i];
-    tx_head++;
-    if (tx_head >= TX_FIFO_SIZE)
-    {
-      tx_head = 0u;
-    }
-    tx_count++;
+    Error_Handler();
   }
+  __HAL_DMA_DISABLE_IT(huart3.hdmarx, DMA_IT_HT);
 }
 
-/* Start one LPUART1_TX DMA burst (<= 256 bytes) from the FIFO when TX is idle.
-   Called only from the main loop. Never waits on tx_busy - returns immediately if
-   a burst is already in flight (no blocking, no spin). */
-static void tx_kick(void)
+static void bridge_send_to_lpuart1(const uint8_t *data, uint16_t len)
 {
-  uint16_t n;
   uint16_t i;
-  uint16_t t;
   uint32_t primask;
 
-  /* Claim the TX path. tx_busy is also cleared by the TX ISRs, so guard the test. */
+  if ((len == 0u) || (len > BRIDGE_BUF_SIZE))
+  {
+    return;
+  }
+
   primask = __get_PRIMASK();
   __disable_irq();
-  if (tx_busy || (tx_count == 0u))
+  if (tx_busy != 0u)
   {
+    drop_cnt += len;
     __set_PRIMASK(primask);
     return;
   }
   tx_busy = 1u;
+  tx_dma_len = len;
   __set_PRIMASK(primask);
 
-  n = (tx_count < TX_DMA_BUF_SIZE) ? tx_count : TX_DMA_BUF_SIZE;
-  tx_dma_len = n;
-
-  t = tx_tail;
-  for (i = 0u; i < n; i++)
+  for (i = 0u; i < len; i++)
   {
-    tx_dma_buf[i] = tx_fifo[t];
-    t++;
-    if (t >= TX_FIFO_SIZE)
-    {
-      t = 0u;
-    }
+    lpuart1_tx_buf[i] = data[i];
   }
 
-  if (HAL_UART_Transmit_DMA(huart_tx, tx_dma_buf, n) == HAL_OK)
+  if (HAL_UART_Transmit_DMA(&hlpuart1, lpuart1_tx_buf, len) != HAL_OK)
   {
-    tx_tail = t;                                  /* commit consumption */
-    tx_count = (uint16_t)(tx_count - n);
-  }
-  else
-  {
-    tx_dma_len = 0u;                              /* start failed: keep FIFO data */
     primask = __get_PRIMASK();
     __disable_irq();
     tx_busy = 0u;
+    tx_dma_len = 0u;
+    tx_err_cnt++;
     __set_PRIMASK(primask);
   }
 }
 
-/* Return 1 if the chunk is non-empty and every byte is 0x00. Used to detect the
-   0x00 flood a board-1 reset produces on the USART3 RX line. */
-static uint8_t chunk_is_all_zero(const uint8_t *data, uint16_t len)
-{
-  uint16_t i;
-
-  if (len == 0u)
-  {
-    return 0u;
-  }
-  for (i = 0u; i < len; i++)
-  {
-    if (data[i] != 0u)
-    {
-      return 0u;
-    }
-  }
-  return 1u;
-}
-
-/* Forward one contiguous RX chunk into the TX FIFO. When DROP_ALL_ZERO_RX_CHUNKS
-   is set, a fully-0x00 chunk is counted and dropped (not forwarded) so a board-1
-   reset cannot flood the downstream link. Never blocks; rx_old_pos still advances
-   in bridge_poll() either way. */
-static void forward_chunk(const uint8_t *data, uint16_t len)
-{
-  rx_bytes += len;
-
-#if (DROP_ALL_ZERO_RX_CHUNKS != 0u)
-  if (chunk_is_all_zero(data, len) != 0u)
-  {
-    zero_burst_cnt++;
-    zero_drop_bytes += len;
-    return;                        /* drop reset noise, do NOT write the FIFO */
-  }
-#endif
-
-  fifo_push(data, len);
-}
-
-/* Main-loop pump: drain the USART3_RX DMA ring into the TX FIFO (via forward_chunk,
-   which filters all-0x00 chunks), then kick TX. The byte copying lives here (thread
-   mode), never in an ISR, so the RX->TX path cannot block. 'rx_write_pos' is the
-   ABSOLUTE DMA write position (0..RX_DMA_BUF_SIZE) recorded by the RX-event ISR. */
-static void bridge_poll(void)
-{
-  uint16_t old;
-  uint16_t pos;
-
-  pos = rx_write_pos;
-  if (pos > RX_DMA_BUF_SIZE)
-  {
-    pos = 0u;
-  }
-  old = rx_old_pos;
-
-  if (pos != old)
-  {
-    if (pos > old)
-    {
-      forward_chunk(&rx_dma_buf[old], (uint16_t)(pos - old));            /* [old,pos) */
-    }
-    else
-    {
-      if (old < RX_DMA_BUF_SIZE)
-      {
-        forward_chunk(&rx_dma_buf[old], (uint16_t)(RX_DMA_BUF_SIZE - old)); /* tail   */
-      }
-      if (pos > 0u)
-      {
-        forward_chunk(&rx_dma_buf[0], pos);                             /* head [0,pos) */
-      }
-    }
-    rx_old_pos = pos;
-  }
-
-  tx_kick();
-}
-
-/* RX: HT / TC / IDLE land here. Minimal by design - only record the DMA write
-   position and event counters. The copy is done by bridge_poll() in the main loop.
-   Never re-arm ReceiveToIdle here (the circular DMA keeps running). */
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
-  if (huart == huart_rx)
+  uint16_t len;
+
+  if (huart != &huart3)
   {
-    uint16_t pos = Size;
-
-    if (pos > RX_DMA_BUF_SIZE)
-    {
-      pos = 0u;
-    }
-
-    switch (HAL_UARTEx_GetRxEventType(huart))
-    {
-      case HAL_UART_RXEVENT_IDLE: rx_event_idle_cnt++; break;
-      case HAL_UART_RXEVENT_HT:   rx_event_ht_cnt++;   break;
-      case HAL_UART_RXEVENT_TC:   rx_event_tc_cnt++;   break;
-      default: break;
-    }
-
-    rx_write_pos = pos;
+    return;
   }
+
+  if (HAL_UARTEx_GetRxEventType(huart) == HAL_UART_RXEVENT_IDLE)
+  {
+    rx_event_idle_cnt++;
+  }
+  else
+  {
+    rx_event_tc_cnt++;
+  }
+
+  len = Size;
+  if (len > BRIDGE_BUF_SIZE)
+  {
+    len = BRIDGE_BUF_SIZE;
+  }
+
+  if (len > 0u)
+  {
+    rx_bytes += len;
+    bridge_send_to_lpuart1(usart3_rx_buf, len);
+  }
+
+  bridge_rx_start();
 }
 
-/* TX burst finished: only release the claim and count bytes. Do NOT kick here -
-   the next bridge_poll() iteration in the main loop starts the following burst. */
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 {
-  if (huart == huart_tx)
+  if (huart == &hlpuart1)
   {
     tx_bytes += tx_dma_len;
     tx_dma_len = 0u;
@@ -409,20 +276,15 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
   }
 }
 
-/* RX error (e.g. ORE stops the DMA): synchronous abort + restart ReceiveToIdle and
-   reset positions. TX error: just release the claim; bridge_poll() resumes on the
-   next iteration. No long work in either branch. */
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
-  if (huart == huart_rx)
+  if (huart == &huart3)
   {
     err_cnt++;
-    (void)HAL_UART_AbortReceive(huart_rx);
-    rx_old_pos = 0u;
-    rx_write_pos = 0u;
-    (void)HAL_UARTEx_ReceiveToIdle_DMA(huart_rx, rx_dma_buf, RX_DMA_BUF_SIZE);
+    (void)HAL_UART_AbortReceive(&huart3);
+    bridge_rx_start();
   }
-  else if (huart == huart_tx)
+  else if (huart == &hlpuart1)
   {
     tx_err_cnt++;
     tx_busy = 0u;

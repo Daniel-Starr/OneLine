@@ -46,18 +46,15 @@
 
 /* USER CODE BEGIN PV */
 
-/* Board 1 bring-up bridge: LPUART1_RX -> USART3_TX.
-   This intentionally follows the known-good single_chuankou_test_01 receive model:
-   one ReceiveToIdle DMA frame is copied into a static TX buffer, then the main loop
-   starts a USART3 TX DMA burst. */
+/* Board 1 direct bridge: LPUART1_RX -> USART3_TX.
+   ReceiveToIdle uses normal DMA. When a frame arrives, the RX callback copies that
+   frame into a static TX buffer and starts USART3 TX DMA immediately. */
 #define BRIDGE_BUF_SIZE 256u
 
 static uint8_t lpuart1_rx_buf[BRIDGE_BUF_SIZE];
 static uint8_t usart3_tx_buf[BRIDGE_BUF_SIZE];
 
-static volatile uint16_t pending_tx_len;
 static volatile uint16_t tx_dma_len;
-static volatile uint8_t frame_ready;
 static volatile uint8_t tx_busy;
 
 static volatile uint32_t rx_bytes;
@@ -74,7 +71,7 @@ static volatile uint32_t rx_event_tc_cnt;
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 static void bridge_rx_start(void);
-static void bridge_tx_poll(void);
+static void bridge_send_to_usart3(const uint8_t *data, uint16_t len);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -130,7 +127,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    bridge_tx_poll();
+    __NOP();
   }
   /* USER CODE END 3 */
 }
@@ -200,41 +197,40 @@ static void bridge_rx_start(void)
   __HAL_DMA_DISABLE_IT(hlpuart1.hdmarx, DMA_IT_HT);
 }
 
-static void bridge_tx_poll(void)
+static void bridge_send_to_usart3(const uint8_t *data, uint16_t len)
 {
-  uint16_t len;
+  uint16_t i;
   uint32_t primask;
+
+  if ((len == 0u) || (len > BRIDGE_BUF_SIZE))
+  {
+    return;
+  }
 
   primask = __get_PRIMASK();
   __disable_irq();
-  if ((frame_ready == 0u) || (tx_busy != 0u))
+  if (tx_busy != 0u)
   {
+    drop_cnt += len;
     __set_PRIMASK(primask);
     return;
   }
-  len = pending_tx_len;
-  frame_ready = 0u;
   tx_busy = 1u;
   tx_dma_len = len;
   __set_PRIMASK(primask);
 
-  if ((len == 0u) || (len > BRIDGE_BUF_SIZE))
+  for (i = 0u; i < len; i++)
   {
-    primask = __get_PRIMASK();
-    __disable_irq();
-    tx_busy = 0u;
-    tx_dma_len = 0u;
-    __set_PRIMASK(primask);
-    return;
+    usart3_tx_buf[i] = data[i];
   }
 
   if (HAL_UART_Transmit_DMA(&huart3, usart3_tx_buf, len) != HAL_OK)
   {
     primask = __get_PRIMASK();
     __disable_irq();
-    frame_ready = 1u;        /* keep the frame for the next main-loop attempt */
     tx_busy = 0u;
     tx_dma_len = 0u;
+    tx_err_cnt++;
     __set_PRIMASK(primask);
   }
 }
@@ -242,7 +238,6 @@ static void bridge_tx_poll(void)
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
   uint16_t len;
-  uint16_t i;
 
   if (huart != &hlpuart1)
   {
@@ -266,20 +261,8 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 
   if (len > 0u)
   {
-    if ((frame_ready != 0u) || (tx_busy != 0u))
-    {
-      drop_cnt += len;
-    }
-    else
-    {
-      for (i = 0u; i < len; i++)
-      {
-        usart3_tx_buf[i] = lpuart1_rx_buf[i];
-      }
-      pending_tx_len = len;
-      frame_ready = 1u;
-      rx_bytes += len;
-    }
+    rx_bytes += len;
+    bridge_send_to_usart3(lpuart1_rx_buf, len);
   }
 
   bridge_rx_start();
@@ -301,8 +284,6 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
   {
     err_cnt++;
     (void)HAL_UART_AbortReceive(&hlpuart1);
-    pending_tx_len = 0u;
-    frame_ready = 0u;
     bridge_rx_start();
   }
   else if (huart == &huart3)
