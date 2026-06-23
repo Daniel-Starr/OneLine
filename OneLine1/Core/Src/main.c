@@ -46,18 +46,24 @@
 
 /* USER CODE BEGIN PV */
 
-/* Board 1 bridge: LPUART1_RX + USART1_RX -> USART3_TX -> Board 2.
-   RX uses ReceiveToIdle in INTERRUPT mode (re-armed in the RX-event callback). Each
-   received frame is copied into the shared static TX buffer and sent by USART3 TX DMA.
-   The two RX sources share one USART3_TX: if TX is busy, the new frame is dropped. */
+/* Board 1 bridge: LPUART1_RX + USART1_RX -> shared TX FIFO -> USART3_TX -> Board 2.
+   The two RX (ReceiveToIdle_IT) callbacks push each frame into the FIFO; the main loop
+   drains the FIFO to USART3 via TX DMA. TX is started ONLY from the main loop and is
+   gated on the HAL TX state (gState) - HAL resets it to READY on completion/error, so
+   a missed/raced completion cannot wedge forwarding. FIFO full -> drop (drop_cnt). */
 #define BRIDGE_BUF_SIZE 256u
+#define TX_FIFO_SIZE    4096u
 
 static uint8_t lpuart1_rx_buf[BRIDGE_BUF_SIZE];   /* LPUART1 RX (ReceiveToIdle_IT) */
 static uint8_t usart1_rx_buf[BRIDGE_BUF_SIZE];    /* USART1  RX (ReceiveToIdle_IT) */
-static uint8_t usart3_tx_buf[BRIDGE_BUF_SIZE];    /* shared USART3 TX staging      */
+static uint8_t usart3_tx_buf[BRIDGE_BUF_SIZE];    /* USART3 TX DMA staging         */
 
+/* Shared TX FIFO. Producers: the two RX callbacks (ISR). Consumer: tx_kick (main). */
+static uint8_t  tx_fifo[TX_FIFO_SIZE];
+static volatile uint16_t tx_head;
+static volatile uint16_t tx_tail;
+static volatile uint16_t tx_count;
 static volatile uint16_t tx_dma_len;
-static volatile uint8_t tx_busy;
 
 static volatile uint32_t rx_bytes;       /* LPUART1 received bytes */
 static volatile uint32_t rx_bytes_u1;    /* USART1  received bytes */
@@ -74,7 +80,8 @@ static volatile uint32_t rx_event_tc_cnt;
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 static void bridge_rx_arm(UART_HandleTypeDef *huart, uint8_t *buf);
-static void bridge_send_to_usart3(const uint8_t *data, uint16_t len);
+static void fifo_push(const uint8_t *data, uint16_t len);
+static void tx_kick(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -131,7 +138,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    __NOP();
+    tx_kick();
   }
   /* USER CODE END 3 */
 }
@@ -208,41 +215,81 @@ static void bridge_rx_arm(UART_HandleTypeDef *huart, uint8_t *buf)
   }
 }
 
-static void bridge_send_to_usart3(const uint8_t *data, uint16_t len)
+/* Push a received frame into the shared TX FIFO (producer side, called from the RX
+   ISRs). FIFO full -> drop the overflow bytes and count them. Short critical section
+   guards the FIFO against the main-loop consumer. */
+static void fifo_push(const uint8_t *data, uint16_t len)
 {
   uint16_t i;
+  uint32_t primask = __get_PRIMASK();
+
+  __disable_irq();
+  for (i = 0u; i < len; i++)
+  {
+    if (tx_count >= TX_FIFO_SIZE)
+    {
+      drop_cnt++;
+      continue;
+    }
+    tx_fifo[tx_head] = data[i];
+    tx_head++;
+    if (tx_head >= TX_FIFO_SIZE)
+    {
+      tx_head = 0u;
+    }
+    tx_count++;
+  }
+  __set_PRIMASK(primask);
+}
+
+/* Drain the FIFO to USART3 via TX DMA. Called ONLY from the main loop. Gated on the
+   HAL TX state, which HAL sets back to READY on completion/error - so it can never get
+   stuck on a manual busy flag. Non-blocking: returns if TX is busy or the FIFO empty. */
+static void tx_kick(void)
+{
+  uint16_t n;
+  uint16_t i;
+  uint16_t t;
   uint32_t primask;
 
-  if ((len == 0u) || (len > BRIDGE_BUF_SIZE))
+  if (huart3.gState != HAL_UART_STATE_READY)
   {
-    return;
+    return;                                  /* a TX DMA is still in flight */
   }
 
   primask = __get_PRIMASK();
   __disable_irq();
-  if (tx_busy != 0u)
+  n = (tx_count < BRIDGE_BUF_SIZE) ? tx_count : BRIDGE_BUF_SIZE;
+  __set_PRIMASK(primask);
+  if (n == 0u)
   {
-    drop_cnt += len;
-    __set_PRIMASK(primask);
     return;
   }
-  tx_busy = 1u;
-  tx_dma_len = len;
-  __set_PRIMASK(primask);
 
-  for (i = 0u; i < len; i++)
+  /* Peek n bytes out of the FIFO (don't advance until the DMA actually starts). */
+  t = tx_tail;
+  for (i = 0u; i < n; i++)
   {
-    usart3_tx_buf[i] = data[i];
+    usart3_tx_buf[i] = tx_fifo[t];
+    t++;
+    if (t >= TX_FIFO_SIZE)
+    {
+      t = 0u;
+    }
   }
 
-  if (HAL_UART_Transmit_DMA(&huart3, usart3_tx_buf, len) != HAL_OK)
+  if (HAL_UART_Transmit_DMA(&huart3, usart3_tx_buf, n) == HAL_OK)
   {
+    tx_dma_len = n;
     primask = __get_PRIMASK();
     __disable_irq();
-    tx_busy = 0u;
-    tx_dma_len = 0u;
-    tx_err_cnt++;
+    tx_tail = t;
+    tx_count = (uint16_t)(tx_count - n);
     __set_PRIMASK(primask);
+  }
+  else
+  {
+    tx_err_cnt++;                            /* keep FIFO data, retry next loop */
   }
 }
 
@@ -268,7 +315,7 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
     if (len > 0u)
     {
       rx_bytes += len;
-      bridge_send_to_usart3(lpuart1_rx_buf, len);
+      fifo_push(lpuart1_rx_buf, len);
     }
     bridge_rx_arm(&hlpuart1, lpuart1_rx_buf);
   }
@@ -277,7 +324,7 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
     if (len > 0u)
     {
       rx_bytes_u1 += len;
-      bridge_send_to_usart3(usart1_rx_buf, len);
+      fifo_push(usart1_rx_buf, len);
     }
     bridge_rx_arm(&huart1, usart1_rx_buf);
   }
@@ -289,7 +336,6 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
   {
     tx_bytes += tx_dma_len;
     tx_dma_len = 0u;
-    tx_busy = 0u;
   }
 }
 
@@ -309,9 +355,7 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
   }
   else if (huart == &huart3)
   {
-    tx_err_cnt++;
-    tx_busy = 0u;
-    tx_dma_len = 0u;
+    tx_err_cnt++;                            /* HAL resets gState->READY; tx_kick resumes */
   }
 }
 
