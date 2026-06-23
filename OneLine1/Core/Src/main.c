@@ -47,23 +47,24 @@
 /* USER CODE BEGIN PV */
 
 /* Board 1 bridge: LPUART1_RX + USART1_RX -> shared TX FIFO -> USART3_TX -> Board 2.
-   The two RX (ReceiveToIdle_IT) callbacks push each frame into the FIFO; the main loop
-   drains the FIFO to USART3 via TX DMA. TX is started ONLY from the main loop and is
-   gated on the HAL TX state (gState) - HAL resets it to READY on completion/error, so
-   a missed/raced completion cannot wedge forwarding. FIFO full -> drop (drop_cnt). */
+   Uses the SAME mechanism proven on Board 2: RX via ReceiveToIdle + normal DMA
+   (re-armed in the callback), TX via a bounded BLOCKING transmit in the main loop.
+   The two RX callbacks push each frame into the FIFO; the main loop drains it to
+   USART3. Nothing depends on a TX-complete interrupt, so it cannot wedge. FIFO full
+   -> drop (drop_cnt). */
 #define BRIDGE_BUF_SIZE 256u
 #define TX_FIFO_SIZE    4096u
+#define TX_TIMEOUT_MS   100u    /* bounded so a stuck TX can never block forever */
 
-static uint8_t lpuart1_rx_buf[BRIDGE_BUF_SIZE];   /* LPUART1 RX (ReceiveToIdle_IT) */
-static uint8_t usart1_rx_buf[BRIDGE_BUF_SIZE];    /* USART1  RX (ReceiveToIdle_IT) */
-static uint8_t usart3_tx_buf[BRIDGE_BUF_SIZE];    /* USART3 TX DMA staging         */
+static uint8_t lpuart1_rx_buf[BRIDGE_BUF_SIZE];   /* LPUART1 RX (ReceiveToIdle_DMA) */
+static uint8_t usart1_rx_buf[BRIDGE_BUF_SIZE];    /* USART1  RX (ReceiveToIdle_DMA) */
+static uint8_t usart3_tx_buf[BRIDGE_BUF_SIZE];    /* USART3 TX staging              */
 
 /* Shared TX FIFO. Producers: the two RX callbacks (ISR). Consumer: tx_kick (main). */
 static uint8_t  tx_fifo[TX_FIFO_SIZE];
 static volatile uint16_t tx_head;
 static volatile uint16_t tx_tail;
 static volatile uint16_t tx_count;
-static volatile uint16_t tx_dma_len;
 
 static volatile uint32_t rx_bytes;       /* LPUART1 received bytes */
 static volatile uint32_t rx_bytes_u1;    /* USART1  received bytes */
@@ -199,17 +200,22 @@ void SystemClock_Config(void)
 
 /* USER CODE BEGIN 4 */
 
-/* Arm one RX port with ReceiveToIdle in INTERRUPT mode (one-shot; re-armed after each
-   frame in the RX-event callback). Never call Error_Handler (no deadlock): on failure
-   abort once and retry, then just count the error. */
+/* Arm one RX port with ReceiveToIdle + normal DMA (one-shot; re-armed after each frame
+   in the RX-event callback), HT interrupt disabled - same as Board 2. Never call
+   Error_Handler (no deadlock): on failure abort once and retry, then count the error. */
 static void bridge_rx_arm(UART_HandleTypeDef *huart, uint8_t *buf)
 {
-  if (HAL_UARTEx_ReceiveToIdle_IT(huart, buf, BRIDGE_BUF_SIZE) == HAL_OK)
+  if (HAL_UARTEx_ReceiveToIdle_DMA(huart, buf, BRIDGE_BUF_SIZE) == HAL_OK)
   {
+    __HAL_DMA_DISABLE_IT(huart->hdmarx, DMA_IT_HT);
     return;
   }
   (void)HAL_UART_AbortReceive(huart);
-  if (HAL_UARTEx_ReceiveToIdle_IT(huart, buf, BRIDGE_BUF_SIZE) != HAL_OK)
+  if (HAL_UARTEx_ReceiveToIdle_DMA(huart, buf, BRIDGE_BUF_SIZE) == HAL_OK)
+  {
+    __HAL_DMA_DISABLE_IT(huart->hdmarx, DMA_IT_HT);
+  }
+  else
   {
     err_cnt++;
   }
@@ -242,20 +248,15 @@ static void fifo_push(const uint8_t *data, uint16_t len)
   __set_PRIMASK(primask);
 }
 
-/* Drain the FIFO to USART3 via TX DMA. Called ONLY from the main loop. Gated on the
-   HAL TX state, which HAL sets back to READY on completion/error - so it can never get
-   stuck on a manual busy flag. Non-blocking: returns if TX is busy or the FIFO empty. */
+/* Drain the FIFO to USART3 with a bounded BLOCKING transmit. Called ONLY from the main
+   loop. No TX-complete interrupt or busy flag is involved, so it cannot wedge; a stuck
+   TX just times out (tx_err_cnt) and is retried on the next loop. */
 static void tx_kick(void)
 {
   uint16_t n;
   uint16_t i;
   uint16_t t;
   uint32_t primask;
-
-  if (huart3.gState != HAL_UART_STATE_READY)
-  {
-    return;                                  /* a TX DMA is still in flight */
-  }
 
   primask = __get_PRIMASK();
   __disable_irq();
@@ -266,7 +267,7 @@ static void tx_kick(void)
     return;
   }
 
-  /* Peek n bytes out of the FIFO (don't advance until the DMA actually starts). */
+  /* Copy n bytes out of the FIFO (don't advance until the transmit succeeds). */
   t = tx_tail;
   for (i = 0u; i < n; i++)
   {
@@ -278,9 +279,9 @@ static void tx_kick(void)
     }
   }
 
-  if (HAL_UART_Transmit_DMA(&huart3, usart3_tx_buf, n) == HAL_OK)
+  if (HAL_UART_Transmit(&huart3, usart3_tx_buf, n, TX_TIMEOUT_MS) == HAL_OK)
   {
-    tx_dma_len = n;
+    tx_bytes += n;
     primask = __get_PRIMASK();
     __disable_irq();
     tx_tail = t;
@@ -289,7 +290,7 @@ static void tx_kick(void)
   }
   else
   {
-    tx_err_cnt++;                            /* keep FIFO data, retry next loop */
+    tx_err_cnt++;                            /* timeout/error: keep data, retry next loop */
   }
 }
 
@@ -330,15 +331,6 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
   }
 }
 
-void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
-{
-  if (huart == &huart3)
-  {
-    tx_bytes += tx_dma_len;
-    tx_dma_len = 0u;
-  }
-}
-
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
   if (huart == &hlpuart1)
@@ -352,10 +344,6 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
     err_cnt++;
     (void)HAL_UART_AbortReceive(&huart1);
     bridge_rx_arm(&huart1, usart1_rx_buf);
-  }
-  else if (huart == &huart3)
-  {
-    tx_err_cnt++;                            /* HAL resets gState->READY; tx_kick resumes */
   }
 }
 
