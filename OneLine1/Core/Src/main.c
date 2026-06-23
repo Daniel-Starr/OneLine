@@ -46,18 +46,21 @@
 
 /* USER CODE BEGIN PV */
 
-/* Board 1 direct bridge: LPUART1_RX -> USART3_TX.
-   ReceiveToIdle uses normal DMA. When a frame arrives, the RX callback copies that
-   frame into a static TX buffer and starts USART3 TX DMA immediately. */
+/* Board 1 bridge: LPUART1_RX + USART1_RX -> USART3_TX -> Board 2.
+   RX uses ReceiveToIdle in INTERRUPT mode (re-armed in the RX-event callback). Each
+   received frame is copied into the shared static TX buffer and sent by USART3 TX DMA.
+   The two RX sources share one USART3_TX: if TX is busy, the new frame is dropped. */
 #define BRIDGE_BUF_SIZE 256u
 
-static uint8_t lpuart1_rx_buf[BRIDGE_BUF_SIZE];
-static uint8_t usart3_tx_buf[BRIDGE_BUF_SIZE];
+static uint8_t lpuart1_rx_buf[BRIDGE_BUF_SIZE];   /* LPUART1 RX (ReceiveToIdle_IT) */
+static uint8_t usart1_rx_buf[BRIDGE_BUF_SIZE];    /* USART1  RX (ReceiveToIdle_IT) */
+static uint8_t usart3_tx_buf[BRIDGE_BUF_SIZE];    /* shared USART3 TX staging      */
 
 static volatile uint16_t tx_dma_len;
 static volatile uint8_t tx_busy;
 
-static volatile uint32_t rx_bytes;
+static volatile uint32_t rx_bytes;       /* LPUART1 received bytes */
+static volatile uint32_t rx_bytes_u1;    /* USART1  received bytes */
 static volatile uint32_t tx_bytes;
 static volatile uint32_t drop_cnt;
 static volatile uint32_t err_cnt;
@@ -70,7 +73,7 @@ static volatile uint32_t rx_event_tc_cnt;
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-static void bridge_rx_start(void);
+static void bridge_rx_arm(UART_HandleTypeDef *huart, uint8_t *buf);
 static void bridge_send_to_usart3(const uint8_t *data, uint16_t len);
 /* USER CODE END PFP */
 
@@ -115,8 +118,9 @@ int main(void)
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
 
-  /* Board 1 minimal link: LPUART1_RX -> USART3_TX -> Board 2. */
-  bridge_rx_start();
+  /* Board 1: LPUART1_RX and USART1_RX both forward to USART3_TX -> Board 2. */
+  bridge_rx_arm(&hlpuart1, lpuart1_rx_buf);
+  bridge_rx_arm(&huart1, usart1_rx_buf);
 
   /* USER CODE END 2 */
 
@@ -188,17 +192,17 @@ void SystemClock_Config(void)
 
 /* USER CODE BEGIN 4 */
 
-static void bridge_rx_start(void)
+/* Arm one RX port with ReceiveToIdle in INTERRUPT mode (one-shot; re-armed after each
+   frame in the RX-event callback). Never call Error_Handler (no deadlock): on failure
+   abort once and retry, then just count the error. */
+static void bridge_rx_arm(UART_HandleTypeDef *huart, uint8_t *buf)
 {
-  /* RX uses ReceiveToIdle in INTERRUPT mode (no DMA). One-shot: re-armed after each
-     frame by the RX-event callback. Never call Error_Handler here (no deadlock):
-     on failure, abort once and retry, then just count the error. */
-  if (HAL_UARTEx_ReceiveToIdle_IT(&hlpuart1, lpuart1_rx_buf, BRIDGE_BUF_SIZE) == HAL_OK)
+  if (HAL_UARTEx_ReceiveToIdle_IT(huart, buf, BRIDGE_BUF_SIZE) == HAL_OK)
   {
     return;
   }
-  (void)HAL_UART_AbortReceive(&hlpuart1);
-  if (HAL_UARTEx_ReceiveToIdle_IT(&hlpuart1, lpuart1_rx_buf, BRIDGE_BUF_SIZE) != HAL_OK)
+  (void)HAL_UART_AbortReceive(huart);
+  if (HAL_UARTEx_ReceiveToIdle_IT(huart, buf, BRIDGE_BUF_SIZE) != HAL_OK)
   {
     err_cnt++;
   }
@@ -244,35 +248,39 @@ static void bridge_send_to_usart3(const uint8_t *data, uint16_t len)
 
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
-  uint16_t len;
+  uint16_t len = Size;
 
-  if (huart != &hlpuart1)
-  {
-    return;
-  }
-
-  if (HAL_UARTEx_GetRxEventType(huart) == HAL_UART_RXEVENT_IDLE)
-  {
-    rx_event_idle_cnt++;
-  }
-  else
-  {
-    rx_event_tc_cnt++;
-  }
-
-  len = Size;
   if (len > BRIDGE_BUF_SIZE)
   {
     len = BRIDGE_BUF_SIZE;
   }
 
-  if (len > 0u)
+  if (huart == &hlpuart1)
   {
-    rx_bytes += len;
-    bridge_send_to_usart3(lpuart1_rx_buf, len);
+    if (HAL_UARTEx_GetRxEventType(huart) == HAL_UART_RXEVENT_IDLE)
+    {
+      rx_event_idle_cnt++;
+    }
+    else
+    {
+      rx_event_tc_cnt++;
+    }
+    if (len > 0u)
+    {
+      rx_bytes += len;
+      bridge_send_to_usart3(lpuart1_rx_buf, len);
+    }
+    bridge_rx_arm(&hlpuart1, lpuart1_rx_buf);
   }
-
-  bridge_rx_start();
+  else if (huart == &huart1)
+  {
+    if (len > 0u)
+    {
+      rx_bytes_u1 += len;
+      bridge_send_to_usart3(usart1_rx_buf, len);
+    }
+    bridge_rx_arm(&huart1, usart1_rx_buf);
+  }
 }
 
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
@@ -291,7 +299,13 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
   {
     err_cnt++;
     (void)HAL_UART_AbortReceive(&hlpuart1);
-    bridge_rx_start();
+    bridge_rx_arm(&hlpuart1, lpuart1_rx_buf);
+  }
+  else if (huart == &huart1)
+  {
+    err_cnt++;
+    (void)HAL_UART_AbortReceive(&huart1);
+    bridge_rx_arm(&huart1, usart1_rx_buf);
   }
   else if (huart == &huart3)
   {
