@@ -188,11 +188,18 @@ void SystemClock_Config(void)
 
 static void bridge_rx_start(void)
 {
-  if (HAL_UARTEx_ReceiveToIdle_DMA(&huart3, usart3_rx_buf, BRIDGE_BUF_SIZE) != HAL_OK)
+  /* RX uses ReceiveToIdle in INTERRUPT mode (no DMA). One-shot: re-armed after each
+     frame by the RX-event callback. Never call Error_Handler here (no deadlock):
+     on failure, abort once and retry, then just count the error. */
+  if (HAL_UARTEx_ReceiveToIdle_IT(&huart3, usart3_rx_buf, BRIDGE_BUF_SIZE) == HAL_OK)
   {
-    Error_Handler();
+    return;
   }
-  __HAL_DMA_DISABLE_IT(huart3.hdmarx, DMA_IT_HT);
+  (void)HAL_UART_AbortReceive(&huart3);
+  if (HAL_UARTEx_ReceiveToIdle_IT(&huart3, usart3_rx_buf, BRIDGE_BUF_SIZE) != HAL_OK)
+  {
+    err_cnt++;
+  }
 }
 
 static void bridge_send_to_lpuart1(const uint8_t *data, uint16_t len)
