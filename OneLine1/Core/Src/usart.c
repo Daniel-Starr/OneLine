@@ -246,7 +246,7 @@ void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
     */
     GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1;
     GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;   /* RX (PC0) idle-high when undriven: no 0x00 noise */
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
     GPIO_InitStruct.Alternate = GPIO_AF8_LPUART1;
     HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
@@ -437,6 +437,7 @@ void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
     GPIOA->OTYPER &= ~(GPIO_OTYPER_OT9 | GPIO_OTYPER_OT10);
     GPIOA->OSPEEDR &= ~(GPIO_OSPEEDR_OSPEED9_Msk | GPIO_OSPEEDR_OSPEED10_Msk);
     GPIOA->PUPDR &= ~(GPIO_PUPDR_PUPD9_Msk | GPIO_PUPDR_PUPD10_Msk);
+    GPIOA->PUPDR |= GPIO_PUPDR_PUPD10_0;   /* PA10 (USART1_RX) pull-up: no 0x00 noise when undriven */
     GPIOA->AFR[1] &= ~((0x0FUL << 4U) | (0x0FUL << 8U));
     GPIOA->AFR[1] |= (((uint32_t)GPIO_AF7_USART1 << 4U) |
                       ((uint32_t)GPIO_AF7_USART1 << 8U));
