@@ -47,17 +47,18 @@
 /* USER CODE BEGIN PV */
 
 /* Board 1 bridge: LPUART1_RX + USART1_RX -> shared TX FIFO -> USART3_TX -> Board 2.
-   Uses the SAME mechanism proven on Board 2: RX via ReceiveToIdle + normal DMA
-   (re-armed in the callback), TX via a bounded BLOCKING transmit in the main loop.
-   The two RX callbacks push each frame into the FIFO; the main loop drains it to
-   USART3. Nothing depends on a TX-complete interrupt, so it cannot wedge. FIFO full
-   -> drop (drop_cnt). */
+   RX uses ReceiveToIdle + CIRCULAR DMA: each port is armed once and the DMA runs
+   forever, so the RX callbacks never call any HAL DMA function (no re-arm, no abort)
+   from interrupt context. Each callback copies the new slice of its circular buffer
+   into the shared FIFO (position-based, wrap-aware). The main loop drains the FIFO to
+   USART3 with a bounded blocking transmit. Nothing re-arms DMA and nothing depends on
+   a TX-complete interrupt, so it cannot wedge or HardFault. FIFO full -> drop. */
 #define BRIDGE_BUF_SIZE 256u
 #define TX_FIFO_SIZE    4096u
 #define TX_TIMEOUT_MS   100u    /* bounded so a stuck TX can never block forever */
 
-static uint8_t lpuart1_rx_buf[BRIDGE_BUF_SIZE];   /* LPUART1 RX (ReceiveToIdle_DMA) */
-static uint8_t usart1_rx_buf[BRIDGE_BUF_SIZE];    /* USART1  RX (ReceiveToIdle_DMA) */
+static uint8_t lpuart1_rx_buf[BRIDGE_BUF_SIZE];   /* LPUART1 RX circular DMA buffer  */
+static uint8_t usart1_rx_buf[BRIDGE_BUF_SIZE];    /* USART1  RX circular DMA buffer  */
 static uint8_t usart3_tx_buf[BRIDGE_BUF_SIZE];    /* USART3 TX staging              */
 
 /* Shared TX FIFO. Producers: the two RX callbacks (ISR). Consumer: tx_kick (main). */
@@ -74,13 +75,15 @@ static volatile uint32_t err_cnt;
 static volatile uint32_t tx_err_cnt;
 static volatile uint32_t rx_event_idle_cnt;
 static volatile uint32_t rx_event_tc_cnt;
+static volatile uint16_t lpuart1_rx_pos;  /* last consumed pos in LPUART1 circular buf */
+static volatile uint16_t usart1_rx_pos;   /* last consumed pos in USART1  circular buf */
 
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-static void bridge_rx_arm(UART_HandleTypeDef *huart, uint8_t *buf);
+static HAL_StatusTypeDef bridge_rx_arm(UART_HandleTypeDef *huart, uint8_t *buf);
 static void fifo_push(const uint8_t *data, uint16_t len);
 static void tx_kick(void);
 /* USER CODE END PFP */
@@ -126,9 +129,10 @@ int main(void)
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
 
-  /* Board 1: LPUART1_RX and USART1_RX both forward to USART3_TX -> Board 2. */
-  bridge_rx_arm(&hlpuart1, lpuart1_rx_buf);
-  bridge_rx_arm(&huart1, usart1_rx_buf);
+  /* Board 1: LPUART1_RX and USART1_RX both forward to USART3_TX -> Board 2.
+     Circular DMA: arm each port ONCE; it then runs continuously (no re-arm). */
+  (void)bridge_rx_arm(&hlpuart1, lpuart1_rx_buf);
+  (void)bridge_rx_arm(&huart1, usart1_rx_buf);
 
   /* USER CODE END 2 */
 
@@ -200,25 +204,19 @@ void SystemClock_Config(void)
 
 /* USER CODE BEGIN 4 */
 
-/* Arm one RX port with ReceiveToIdle + normal DMA (one-shot; re-armed after each frame
-   in the RX-event callback), HT interrupt disabled - same as Board 2. Never call
-   Error_Handler (no deadlock): on failure abort once and retry, then count the error. */
-static void bridge_rx_arm(UART_HandleTypeDef *huart, uint8_t *buf)
+/* Arm one RX port with ReceiveToIdle + CIRCULAR DMA. Called once at startup; the
+   circular DMA then runs continuously, so the RX callbacks never re-arm and never
+   call any HAL DMA function from interrupt context. HT is left ENABLED so the
+   half-transfer event lets us drain the buffer before the DMA wraps over it. */
+static HAL_StatusTypeDef bridge_rx_arm(UART_HandleTypeDef *huart, uint8_t *buf)
 {
   if (HAL_UARTEx_ReceiveToIdle_DMA(huart, buf, BRIDGE_BUF_SIZE) == HAL_OK)
   {
-    __HAL_DMA_DISABLE_IT(huart->hdmarx, DMA_IT_HT);
-    return;
+    return HAL_OK;
   }
-  (void)HAL_UART_AbortReceive(huart);
-  if (HAL_UARTEx_ReceiveToIdle_DMA(huart, buf, BRIDGE_BUF_SIZE) == HAL_OK)
-  {
-    __HAL_DMA_DISABLE_IT(huart->hdmarx, DMA_IT_HT);
-  }
-  else
-  {
-    err_cnt++;
-  }
+
+  err_cnt++;
+  return HAL_ERROR;
 }
 
 /* Push a received frame into the shared TX FIFO (producer side, called from the RX
@@ -294,17 +292,20 @@ static void tx_kick(void)
   }
 }
 
+/* Circular-DMA RX event: Size is the current DMA write position in the circular
+   buffer (0..BRIDGE_BUF_SIZE). Copy everything new since our last position into the
+   shared FIFO, handling the wrap. No re-arm -- the circular DMA keeps running. */
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
-  uint16_t len = Size;
-
-  if (len > BRIDGE_BUF_SIZE)
+  if (Size > BRIDGE_BUF_SIZE)
   {
-    len = BRIDGE_BUF_SIZE;
+    Size = BRIDGE_BUF_SIZE;
   }
 
   if (huart == &hlpuart1)
   {
+    uint16_t pos = lpuart1_rx_pos;
+
     if (HAL_UARTEx_GetRxEventType(huart) == HAL_UART_RXEVENT_IDLE)
     {
       rx_event_idle_cnt++;
@@ -313,37 +314,58 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
     {
       rx_event_tc_cnt++;
     }
-    if (len > 0u)
+
+    if (Size != pos)
     {
-      rx_bytes += len;
-      fifo_push(lpuart1_rx_buf, len);
+      if (Size > pos)
+      {
+        rx_bytes += (uint32_t)(Size - pos);
+        fifo_push(&lpuart1_rx_buf[pos], (uint16_t)(Size - pos));
+      }
+      else
+      {
+        rx_bytes += (uint32_t)(BRIDGE_BUF_SIZE - pos) + Size;
+        fifo_push(&lpuart1_rx_buf[pos], (uint16_t)(BRIDGE_BUF_SIZE - pos));
+        if (Size > 0u)
+        {
+          fifo_push(&lpuart1_rx_buf[0], Size);
+        }
+      }
+      lpuart1_rx_pos = (Size >= BRIDGE_BUF_SIZE) ? 0u : Size;
     }
-    bridge_rx_arm(&hlpuart1, lpuart1_rx_buf);
   }
   else if (huart == &huart1)
   {
-    if (len > 0u)
+    uint16_t pos = usart1_rx_pos;
+
+    if (Size != pos)
     {
-      rx_bytes_u1 += len;
-      fifo_push(usart1_rx_buf, len);
+      if (Size > pos)
+      {
+        rx_bytes_u1 += (uint32_t)(Size - pos);
+        fifo_push(&usart1_rx_buf[pos], (uint16_t)(Size - pos));
+      }
+      else
+      {
+        rx_bytes_u1 += (uint32_t)(BRIDGE_BUF_SIZE - pos) + Size;
+        fifo_push(&usart1_rx_buf[pos], (uint16_t)(BRIDGE_BUF_SIZE - pos));
+        if (Size > 0u)
+        {
+          fifo_push(&usart1_rx_buf[0], Size);
+        }
+      }
+      usart1_rx_pos = (Size >= BRIDGE_BUF_SIZE) ? 0u : Size;
     }
-    bridge_rx_arm(&huart1, usart1_rx_buf);
   }
 }
 
+/* Circular DMA keeps running across UART errors; just count them. No HAL DMA call
+   here -- that would re-enter HAL from interrupt context (the old HardFault path). */
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
-  if (huart == &hlpuart1)
+  if ((huart == &hlpuart1) || (huart == &huart1))
   {
     err_cnt++;
-    (void)HAL_UART_AbortReceive(&hlpuart1);
-    bridge_rx_arm(&hlpuart1, lpuart1_rx_buf);
-  }
-  else if (huart == &huart1)
-  {
-    err_cnt++;
-    (void)HAL_UART_AbortReceive(&huart1);
-    bridge_rx_arm(&huart1, usart1_rx_buf);
   }
 }
 
