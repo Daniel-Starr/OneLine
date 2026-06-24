@@ -52,8 +52,9 @@
    context. The callback copies the new slice of the circular buffer into the shared
    FIFO (position-based, wrap-aware). The main loop drains the FIFO to LPUART1 with a
    bounded BLOCKING transmit, so a stuck TX times out instead of hanging forever.
-   Nothing re-arms DMA and nothing depends on a TX-complete interrupt, so it cannot
-   wedge or HardFault. FIFO full -> drop (drop_cnt). */
+   DMA is only re-armed from the main loop (error recovery), never from an ISR, and
+   nothing depends on a TX-complete interrupt, so it cannot wedge or HardFault. FIFO
+   full -> drop (drop_cnt). */
 #define BRIDGE_BUF_SIZE 256u
 #define TX_FIFO_SIZE    4096u
 #define TX_TIMEOUT_MS   100u    /* bounded so a stuck TX can never block forever */
@@ -75,6 +76,7 @@ static volatile uint32_t tx_err_cnt;
 static volatile uint32_t rx_event_idle_cnt;
 static volatile uint32_t rx_event_tc_cnt;
 static volatile uint16_t usart3_rx_pos;   /* last consumed pos in USART3 circular buf */
+static volatile uint8_t  usart3_rx_err;   /* RX error -> main loop re-arms the DMA      */
 
 /* USER CODE END PV */
 
@@ -82,6 +84,7 @@ static volatile uint16_t usart3_rx_pos;   /* last consumed pos in USART3 circula
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 static HAL_StatusTypeDef bridge_rx_arm(UART_HandleTypeDef *huart, uint8_t *buf);
+static void bridge_rx_recover(void);
 static void fifo_push(const uint8_t *data, uint16_t len);
 static void tx_kick(void);
 /* USER CODE END PFP */
@@ -138,6 +141,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    bridge_rx_recover();
     tx_kick();
   }
   /* USER CODE END 3 */
@@ -212,6 +216,24 @@ static HAL_StatusTypeDef bridge_rx_arm(UART_HandleTypeDef *huart, uint8_t *buf)
 
   err_cnt++;
   return HAL_ERROR;
+}
+
+/* Recover the port whose circular DMA the HAL aborted on a UART error (the HAL aborts
+   RX DMA on ANY error during DMA reception). Without this the port stays dead until
+   reset. Runs in the MAIN LOOP (thread context) so calling HAL DMA here is safe; the
+   ISR only sets the flag. Clear the flag first, then re-arm; if the abort isn't
+   finished yet (ReceiveToIdle returns !=OK) set the flag again to retry next loop. */
+static void bridge_rx_recover(void)
+{
+  if (usart3_rx_err != 0u)
+  {
+    usart3_rx_err = 0u;
+    usart3_rx_pos = 0u;
+    if (HAL_UARTEx_ReceiveToIdle_DMA(&huart3, usart3_rx_buf, BRIDGE_BUF_SIZE) != HAL_OK)
+    {
+      usart3_rx_err = 1u;
+    }
+  }
 }
 
 /* Push a received slice into the shared TX FIFO (producer, called from the RX ISR).
@@ -331,13 +353,15 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
   }
 }
 
-/* Circular DMA keeps running across UART errors; just count them. No HAL DMA call
-   here -- that would re-enter HAL from interrupt context. */
+/* The HAL aborts the RX DMA on ANY error during DMA reception, so the port would stay
+   dead. Don't re-arm here (ISR context) -- just flag it; bridge_rx_recover() re-arms it
+   from the main loop. */
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
   if (huart == &huart3)
   {
     err_cnt++;
+    usart3_rx_err = 1u;
   }
 }
 
