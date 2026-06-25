@@ -126,8 +126,8 @@ int main(void)
   MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
 
-  /* Board 2: USART3_RX -> LPUART1_TX -> PC. Circular DMA: arm ONCE; it then runs
-     continuously (no re-arm), so the RX callback never calls any HAL DMA function. */
+  /* Board 2: USART3_RX -> LPUART1_TX -> PC. One-shot DMA: arm here; the RX callback
+     re-flags and the main loop (bridge_rx_service) re-arms it after every frame. */
   (void)bridge_rx_arm(&huart3, usart3_rx_buf);
 
   /* USER CODE END 2 */

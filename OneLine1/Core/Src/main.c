@@ -131,7 +131,8 @@ int main(void)
   /* USER CODE BEGIN 2 */
 
   /* Board 1: LPUART1_RX and USART1_RX both forward to USART3_TX -> Board 2.
-     Circular DMA: arm each port ONCE; it then runs continuously (no re-arm). */
+     One-shot DMA: arm each port here; the RX callback re-flags and the main loop
+     (bridge_rx_service) re-arms it after every frame. */
   (void)bridge_rx_arm(&hlpuart1, lpuart1_rx_buf);
   (void)bridge_rx_arm(&huart1, usart1_rx_buf);
 
