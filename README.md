@@ -1,4 +1,4 @@
-# NormalDMA
+# NormalDMA 串口桥
 
 > DMA 接收 + FIFO 缓冲 + 阻塞发送
 
