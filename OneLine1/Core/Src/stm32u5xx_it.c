@@ -41,6 +41,18 @@
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN PV */
+volatile uint32_t fault_cfsr;
+volatile uint32_t fault_hfsr;
+volatile uint32_t fault_mmfar;
+volatile uint32_t fault_bfar;
+volatile uint32_t fault_r0;
+volatile uint32_t fault_r1;
+volatile uint32_t fault_r2;
+volatile uint32_t fault_r3;
+volatile uint32_t fault_r12;
+volatile uint32_t fault_lr;
+volatile uint32_t fault_pc;
+volatile uint32_t fault_xpsr;
 
 /* USER CODE END PV */
 
@@ -51,6 +63,26 @@
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+__attribute__((used, noinline)) void hardfault_capture(uint32_t *stacked)
+{
+  fault_cfsr = SCB->CFSR;
+  fault_hfsr = SCB->HFSR;
+  fault_mmfar = SCB->MMFAR;
+  fault_bfar = SCB->BFAR;
+  fault_r0 = stacked[0];
+  fault_r1 = stacked[1];
+  fault_r2 = stacked[2];
+  fault_r3 = stacked[3];
+  fault_r12 = stacked[4];
+  fault_lr = stacked[5];
+  fault_pc = stacked[6];
+  fault_xpsr = stacked[7];
+
+  __disable_irq();
+  while (1)
+  {
+  }
+}
 
 /* USER CODE END 0 */
 
@@ -94,16 +126,16 @@ void NMI_Handler(void)
 /**
   * @brief This function handles Hard fault interrupt.
   */
-void HardFault_Handler(void)
+__attribute__((naked)) void HardFault_Handler(void)
 {
   /* USER CODE BEGIN HardFault_IRQn 0 */
-
+  __asm volatile (
+    "tst lr, #4 \n"
+    "ite eq     \n"
+    "mrseq r0, msp \n"
+    "mrsne r0, psp \n"
+    "b hardfault_capture \n");
   /* USER CODE END HardFault_IRQn 0 */
-  while (1)
-  {
-    /* USER CODE BEGIN W1_HardFault_IRQn 0 */
-    /* USER CODE END W1_HardFault_IRQn 0 */
-  }
 }
 
 /**
@@ -219,7 +251,7 @@ void GPDMA1_Channel0_IRQHandler(void)
   /* USER CODE BEGIN GPDMA1_Channel0_IRQn 0 */
 
   /* USER CODE END GPDMA1_Channel0_IRQn 0 */
-  HAL_DMA_IRQHandler(&handle_GPDMA1_Channel0);
+  Board1_Lpuart1DmaIrq();
   /* USER CODE BEGIN GPDMA1_Channel0_IRQn 1 */
 
   /* USER CODE END GPDMA1_Channel0_IRQn 1 */
@@ -261,7 +293,7 @@ void GPDMA1_Channel4_IRQHandler(void)
   /* USER CODE BEGIN GPDMA1_Channel4_IRQn 0 */
 
   /* USER CODE END GPDMA1_Channel4_IRQn 0 */
-  HAL_DMA_IRQHandler(&handle_GPDMA1_Channel4);
+  Board1_Usart1DmaIrq();
   /* USER CODE BEGIN GPDMA1_Channel4_IRQn 1 */
 
   /* USER CODE END GPDMA1_Channel4_IRQn 1 */
@@ -275,7 +307,7 @@ void USART1_IRQHandler(void)
   /* USER CODE BEGIN USART1_IRQn 0 */
 
   /* USER CODE END USART1_IRQn 0 */
-  HAL_UART_IRQHandler(&huart1);
+  Board1_Usart1UartIrq();
   /* USER CODE BEGIN USART1_IRQn 1 */
 
   /* USER CODE END USART1_IRQn 1 */
@@ -317,7 +349,7 @@ void LPUART1_IRQHandler(void)
   /* USER CODE BEGIN LPUART1_IRQn 0 */
 
   /* USER CODE END LPUART1_IRQn 0 */
-  HAL_UART_IRQHandler(&hlpuart1);
+  Board1_Lpuart1UartIrq();
   /* USER CODE BEGIN LPUART1_IRQn 1 */
 
   /* USER CODE END LPUART1_IRQn 1 */
