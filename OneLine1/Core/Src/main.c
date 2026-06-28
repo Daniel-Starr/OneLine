@@ -78,6 +78,12 @@ static volatile uint32_t tx_bytes;
 static volatile uint32_t drop_cnt;
 static volatile uint32_t err_cnt;
 static volatile uint32_t rx_start_stage; /* 启动进度:1=LP起,2=U1起,3=两路都起好 */
+/* 出错重启标志:UART 出错时 HAL 会中止该路 DMA -> 在错误回调里置位,主循环里重新装一遍,
+   这样某一路(用户插拔产生的瞬时错误)被中止后能自动恢复,不会一路死掉/卡死。 */
+static volatile uint8_t rearm_lp;
+static volatile uint8_t rearm_u1;
+static volatile uint32_t rearm_lp_cnt;   /* 调试:各路实际重启了几次 */
+static volatile uint32_t rearm_u1_cnt;
 
 /* 两路 RX DMA 通道句柄(来自 usart.c)。MspInit 把它们建成 circular 链表并已把节点插进
    List_GPDMA1_Channel0/4(NodeNumber 已=1);若 main 再往这些表里 InsertNode 会把 NodeNumber
@@ -187,6 +193,27 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    /* If a UART error aborted a path's DMA, re-arm it here (thread context, not ISR). A
+       transient error on a user-plugged input must NOT permanently kill that input. */
+    if (rearm_lp != 0u)
+    {
+      rearm_lp = 0u;
+      rx_last_pos_lp = 0u;
+      rearm_lp_cnt++;
+      (void)rx_dma_circular_start(&hlpuart1, &handle_GPDMA1_Channel0, &rx_node_lp,
+                                  &rx_list_lp, GPDMA1_Channel0,
+                                  GPDMA1_REQUEST_LPUART1_RX, dma_rx_lp);
+    }
+    if (rearm_u1 != 0u)
+    {
+      rearm_u1 = 0u;
+      rx_last_pos_u1 = 0u;
+      rearm_u1_cnt++;
+      (void)rx_dma_circular_start(&huart1, &handle_GPDMA1_Channel4, &rx_node_u1,
+                                  &rx_list_u1, GPDMA1_Channel4,
+                                  GPDMA1_REQUEST_USART1_RX, dma_rx_u1);
+    }
+
     tx_kick();   /* both RX are DMA + interrupt-driven; the loop only drains the queue to TX */
   }
   /* USER CODE END 3 */
@@ -263,6 +290,10 @@ static HAL_StatusTypeDef rx_dma_circular_start(UART_HandleTypeDef *huart,
                                                uint8_t *buffer)
 {
   DMA_NodeConfTypeDef nc = {0};
+
+  /* Stop any in-progress or errored reception and force RxState back to READY. Harmless on the
+     first (startup) call; essential when re-arming after a UART error aborted this path. */
+  (void)HAL_UART_AbortReceive(huart);
 
   /* MspInit built this channel as circular LL but with an UNBOUND node; tear down & rebuild. */
   (void)HAL_DMA_DeInit(hdma);
@@ -395,12 +426,20 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
   }
 }
 
-/* Circular DMA keeps running across UART errors; just count them. No HAL DMA call here. */
+/* A UART error (overrun/framing/noise) makes HAL abort that path's circular DMA. Count it and
+   flag the path for re-arm in the main loop -- a transient error on a user-plugged input must
+   not permanently kill that input. We re-arm in thread context (not here in the ISR). */
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
-  if ((huart == &hlpuart1) || (huart == &huart1))
+  if (huart == &hlpuart1)
   {
     err_cnt++;
+    rearm_lp = 1u;
+  }
+  else if (huart == &huart1)
+  {
+    err_cnt++;
+    rearm_u1 = 1u;
   }
 }
 
