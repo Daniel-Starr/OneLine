@@ -251,7 +251,7 @@ void GPDMA1_Channel0_IRQHandler(void)
   /* USER CODE BEGIN GPDMA1_Channel0_IRQn 0 */
 
   /* USER CODE END GPDMA1_Channel0_IRQn 0 */
-  Board1_Lpuart1DmaIrq();
+  HAL_DMA_IRQHandler(&handle_GPDMA1_Channel0);
   /* USER CODE BEGIN GPDMA1_Channel0_IRQn 1 */
 
   /* USER CODE END GPDMA1_Channel0_IRQn 1 */
@@ -293,7 +293,7 @@ void GPDMA1_Channel4_IRQHandler(void)
   /* USER CODE BEGIN GPDMA1_Channel4_IRQn 0 */
 
   /* USER CODE END GPDMA1_Channel4_IRQn 0 */
-  Board1_Usart1DmaIrq();
+  HAL_DMA_IRQHandler(&handle_GPDMA1_Channel4);
   /* USER CODE BEGIN GPDMA1_Channel4_IRQn 1 */
 
   /* USER CODE END GPDMA1_Channel4_IRQn 1 */
@@ -307,7 +307,7 @@ void USART1_IRQHandler(void)
   /* USER CODE BEGIN USART1_IRQn 0 */
 
   /* USER CODE END USART1_IRQn 0 */
-  Board1_Usart1UartIrq();
+  HAL_UART_IRQHandler(&huart1);
   /* USER CODE BEGIN USART1_IRQn 1 */
 
   /* USER CODE END USART1_IRQn 1 */
@@ -349,7 +349,7 @@ void LPUART1_IRQHandler(void)
   /* USER CODE BEGIN LPUART1_IRQn 0 */
 
   /* USER CODE END LPUART1_IRQn 0 */
-  Board1_Lpuart1UartIrq();
+  HAL_UART_IRQHandler(&hlpuart1);
   /* USER CODE BEGIN LPUART1_IRQn 1 */
 
   /* USER CODE END LPUART1_IRQn 1 */

@@ -53,10 +53,6 @@ extern "C" {
 void Error_Handler(void);
 
 /* USER CODE BEGIN EFP */
-void Board1_Lpuart1DmaIrq(void);
-void Board1_Usart1DmaIrq(void);
-void Board1_Lpuart1UartIrq(void);
-void Board1_Usart1UartIrq(void);
 
 /* USER CODE END EFP */
 

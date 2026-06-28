@@ -24,7 +24,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -46,21 +46,23 @@
 
 /* USER CODE BEGIN PV */
 
-/* Board 1 bridge: LPUART1_RX + USART1_RX --(each: circular DMA HT/TC/IDLE)--> 512KB queue
-   --> USART3_TX(poll) -> Board 2. 经典 "DMA(半/全传输中断)+串口空闲中断+环形队列",两路合并:
+/* Board 1 bridge: LPUART1_RX(PC0) + USART1_RX(PA10) --(each: circular DMA, HT/TC/IDLE)-->
+   512KB ring queue --> USART3_TX(PA7, poll) -> Board 2. 经典 "DMA(半/全传输中断)+串口空闲中断+
+   环形队列",两路按到达顺序合并到一条 TX:
      - RX: LPUART1 与 USART1 各用一路 circular DMA 连续接进各自的 dma_rx_* 缓冲;ReceiveToIdle_DMA
-       各装一次、永不重装。HAL 在 HT/TC/IDLE 回调 RxEventCallback(按 huart 区分两路),把新字节
-       (环绕处理)搬进同一个 512KB 应用环形队列(两路在此按到达顺序合并)。RX 不在 ISR 调 HAL DMA。
+       各装一次、永不重装。HAL 在 半满(HT)/满(TC)/空闲(IDLE) 回调 HAL_UARTEx_RxEventCallback
+       (按 huart 区分两路),把新到字节(环绕处理)搬进同一个 512KB 应用环形队列。RX 全程不在
+       ISR 里调任何 HAL DMA 函数。
      - TX: 主循环轮询 USART3 TXE,从队列取一字节写 TDR(直写寄存器,无句柄,最稳)。
-   关键安全点(上次 wild-write 的根因):每路 circular 链表节点的 DstAddress 显式绑死到对应缓冲,
-   且 Size clamp 到 [0,DMA_RX_SIZE] -> DMA 只在各自缓冲内回绕、不越界(已在 board2 单路验证)。
-   溢出只丢(drop_cnt),不卡死。U575 RAM 768KB,缓冲开大尽量不丢。 */
+   关键安全点(上次 wild-write/HardFault 的根因):每路 circular 链表节点都用 HAL_DMAEx_List_BuildNode
+   带 DstAddress/DataSize 重新构建并绑死到对应缓冲(与已验证的 board2 完全相同的修复),DMA 只在
+   各自缓冲内回绕、绝不越界写。溢出只丢(drop_cnt)不卡死。U575 RAM 768KB,缓冲开大尽量不丢。 */
 #define DMA_RX_SIZE   1024u          /* 每路 RX circular DMA 硬件缓冲 */
 #define TX_QUEUE_SIZE (512u * 1024u) /* 应用环形队列 512KB(U575 RAM 768KB,够) */
 
 /* 两路 RX 循环 DMA 缓冲(DMA 硬件写,RxEventCallback 读)+ 各自消费位置 */
-static uint8_t dma_rx_lp[DMA_RX_SIZE];         /* LPUART1 */
-static uint8_t dma_rx_u1[DMA_RX_SIZE];         /* USART1  */
+static uint8_t dma_rx_lp[DMA_RX_SIZE];          /* LPUART1 (PC0)  */
+static uint8_t dma_rx_u1[DMA_RX_SIZE];          /* USART1  (PA10) */
 static volatile uint16_t rx_last_pos_lp;
 static volatile uint16_t rx_last_pos_u1;
 
@@ -75,58 +77,36 @@ static volatile uint32_t rx_bytes_u1;    /* USART1  received bytes */
 static volatile uint32_t tx_bytes;
 static volatile uint32_t drop_cnt;
 static volatile uint32_t err_cnt;
+static volatile uint32_t rx_start_stage; /* 启动进度:1=LP起,2=U1起,3=两路都起好 */
 
-/* usart.c 里的 DMA 句柄/节点/队列(Ch0=LPUART1_RX, Ch4=USART1_RX);在 main 里重配成 circular */
-extern DMA_HandleTypeDef handle_GPDMA1_Channel0;
-extern DMA_NodeTypeDef   Node_GPDMA1_Channel0;
-extern DMA_HandleTypeDef handle_GPDMA1_Channel4;
-extern DMA_NodeTypeDef   Node_GPDMA1_Channel4;
+/* 两路 RX DMA 通道句柄(来自 usart.c)。MspInit 把它们建成 circular 链表并已把节点插进
+   List_GPDMA1_Channel0/4(NodeNumber 已=1);若 main 再往这些表里 InsertNode 会把 NodeNumber
+   重复计成 2 -> 链表遍历走飞 -> DMA 回绕时按错误节点重载目标地址 -> 野写崩溃。
+   因此这里 DeInit 后改用我们"自己的全新空队列"重建(等价于 board2:它的 MspInit 用 DMA_NORMAL,
+   List 本就是空的)。 */
+extern DMA_HandleTypeDef handle_GPDMA1_Channel0;   /* LPUART1_RX */
+extern DMA_HandleTypeDef handle_GPDMA1_Channel4;   /* USART1_RX  */
 
-typedef struct
-{
-  DMA_HandleTypeDef *hdma;
-  DMA_NodeTypeDef *node;
-  DMA_Channel_TypeDef *channel;
-  USART_TypeDef *uart;
-  uint8_t *buffer;
-  volatile uint16_t *last_pos;
-  volatile uint32_t *rx_count;
-  volatile uint32_t *ht_count;
-  volatile uint32_t *tc_count;
-  volatile uint32_t *idle_count;
-  volatile uint32_t *dma_error_count;
-} Board1_RxPath;
-
-static volatile uint32_t rx_ht_lp;
-static volatile uint32_t rx_tc_lp;
-static volatile uint32_t rx_idle_lp;
-static volatile uint32_t rx_dma_err_lp;
-static volatile uint32_t rx_ht_u1;
-static volatile uint32_t rx_tc_u1;
-static volatile uint32_t rx_idle_u1;
-static volatile uint32_t rx_dma_err_u1;
-static volatile uint32_t rx_start_stage;
-static volatile uint32_t rx_start_error;
-
-static Board1_RxPath rx_path_lp = {
-  &handle_GPDMA1_Channel0, &Node_GPDMA1_Channel0, GPDMA1_Channel0, LPUART1,
-  dma_rx_lp, &rx_last_pos_lp, &rx_bytes, &rx_ht_lp, &rx_tc_lp, &rx_idle_lp, &rx_dma_err_lp
-};
-static Board1_RxPath rx_path_u1 = {
-  &handle_GPDMA1_Channel4, &Node_GPDMA1_Channel4, GPDMA1_Channel4, USART1,
-  dma_rx_u1, &rx_last_pos_u1, &rx_bytes_u1, &rx_ht_u1, &rx_tc_u1, &rx_idle_u1, &rx_dma_err_u1
-};
+/* 两路 RX 用的全新链表队列 + 节点(在 main 里构建)。static => 整个运行期都在,供 DMA 读取。 */
+static DMA_NodeTypeDef  rx_node_lp;
+static DMA_QListTypeDef rx_list_lp;
+static DMA_NodeTypeDef  rx_node_u1;
+static DMA_QListTypeDef rx_list_u1;
 
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-static HAL_StatusTypeDef board1_rx_start(Board1_RxPath *path);
-static uint16_t board1_rx_write_pos(const Board1_RxPath *path);
-static void board1_rx_drain(Board1_RxPath *path, uint16_t pos);
-static void board1_rx_dma_irq(Board1_RxPath *path);
-static void board1_rx_uart_irq(Board1_RxPath *path);
+static HAL_StatusTypeDef rx_dma_circular_start(UART_HandleTypeDef *huart,
+                                               DMA_HandleTypeDef *hdma,
+                                               DMA_NodeTypeDef *node,
+                                               DMA_QListTypeDef *list,
+                                               DMA_Channel_TypeDef *channel,
+                                               uint32_t request,
+                                               uint8_t *buffer);
+static void rx_event_drain(const uint8_t *buf, volatile uint16_t *last_pos,
+                           volatile uint32_t *rx_count, uint16_t Size);
 static void txq_push(const uint8_t *data, uint16_t len);
 static void tx_kick(void);
 /* USER CODE END PFP */
@@ -144,6 +124,14 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
+
+  /* A previous run's circular DMA can still be active across a warm reset (debugger reflash, a
+     core-only RST, or a watchdog/fault reset do NOT reset GPDMA). Re-arming an already-running
+     channel makes HAL_DMAEx_List_Start_IT dereference stale list state and fault intermittently
+     at startup. Force-reset GPDMA1 first so we always arm from a clean, idle peripheral. */
+  __HAL_RCC_GPDMA1_CLK_ENABLE();
+  __HAL_RCC_GPDMA1_FORCE_RESET();
+  __HAL_RCC_GPDMA1_RELEASE_RESET();
 
   /* USER CODE END 1 */
 
@@ -172,15 +160,19 @@ int main(void)
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
 
-  /* Board 1: LPUART1_RX + USART1_RX 各装一次 circular DMA(永不重装),合并进 512KB 队列;
-     TX 轮询 USART3。两路循环 DMA 节点都显式绑定到各自缓冲(circular wild-write 的修复)。 */
+  /* Board 1: 两路 RX 各装一次 circular DMA(永不重装),合并进 512KB 队列;TX 轮询 USART3。
+     两路节点都带 DstAddress 重建并绑死到各自缓冲(circular wild-write/HardFault 的根治)。 */
   rx_start_stage = 1U;
-  if (board1_rx_start(&rx_path_lp) != HAL_OK)
+  if (rx_dma_circular_start(&hlpuart1, &handle_GPDMA1_Channel0, &rx_node_lp,
+                            &rx_list_lp, GPDMA1_Channel0,
+                            GPDMA1_REQUEST_LPUART1_RX, dma_rx_lp) != HAL_OK)
   {
     Error_Handler();
   }
   rx_start_stage = 2U;
-  if (board1_rx_start(&rx_path_u1) != HAL_OK)
+  if (rx_dma_circular_start(&huart1, &handle_GPDMA1_Channel4, &rx_node_u1,
+                            &rx_list_u1, GPDMA1_Channel4,
+                            GPDMA1_REQUEST_USART1_RX, dma_rx_u1) != HAL_OK)
   {
     Error_Handler();
   }
@@ -256,168 +248,160 @@ void SystemClock_Config(void)
 
 /* USER CODE BEGIN 4 */
 
-/* Bind an already-linked circular DMA channel, then start it exactly once. */
-static HAL_StatusTypeDef board1_rx_start(Board1_RxPath *path)
+/* Configure one UART's RX as CIRCULAR DMA into `buffer` and start it once. The fix vs the old
+   crash: the linked-list node's DstAddress/DataSize are bound EXPLICITLY to `buffer` (rebuilt
+   here, not patched), so on every wrap the GPDMA reloads the correct destination -- the unbound
+   node built in MspInit was what wild-wrote RAM and HardFaulted before. ReceiveToIdle then gives
+   HT/TC/IDLE events via HAL_UARTEx_RxEventCallback. Identical recipe to board2, used for both
+   LPUART1 and USART1. */
+static HAL_StatusTypeDef rx_dma_circular_start(UART_HandleTypeDef *huart,
+                                               DMA_HandleTypeDef *hdma,
+                                               DMA_NodeTypeDef *node,
+                                               DMA_QListTypeDef *list,
+                                               DMA_Channel_TypeDef *channel,
+                                               uint32_t request,
+                                               uint8_t *buffer)
 {
-  path->node->LinkRegisters[NODE_CBR1_DEFAULT_OFFSET] = DMA_RX_SIZE;
-  path->node->LinkRegisters[NODE_CSAR_DEFAULT_OFFSET] = (uint32_t)&path->uart->RDR;
-  path->node->LinkRegisters[NODE_CDAR_DEFAULT_OFFSET] = (uint32_t)path->buffer;
-  path->channel->CFCR = DMA_CFCR_TCF | DMA_CFCR_HTF | DMA_CFCR_DTEF |
-                        DMA_CFCR_ULEF | DMA_CFCR_USEF | DMA_CFCR_TOF;
+  DMA_NodeConfTypeDef nc = {0};
 
-  if (HAL_DMAEx_List_Start_IT(path->hdma) != HAL_OK)
-  {
-    rx_start_error++;
-    return HAL_ERROR;
-  }
+  /* MspInit built this channel as circular LL but with an UNBOUND node; tear down & rebuild. */
+  (void)HAL_DMA_DeInit(hdma);
 
-  SET_BIT(path->channel->CCR, DMA_CCR_HTIE | DMA_CCR_TCIE | DMA_CCR_DTEIE |
-                              DMA_CCR_ULEIE | DMA_CCR_USEIE | DMA_CCR_TOIE);
-  SET_BIT(path->uart->CR3, USART_CR3_DMAR | USART_CR3_EIE);
-  SET_BIT(path->uart->CR1, USART_CR1_IDLEIE);
-  return HAL_OK;
+  nc.NodeType                         = DMA_GPDMA_LINEAR_NODE;
+  nc.Init.Request                     = request;
+  nc.Init.BlkHWRequest                = DMA_BREQ_SINGLE_BURST;
+  nc.Init.Direction                   = DMA_PERIPH_TO_MEMORY;
+  nc.Init.SrcInc                      = DMA_SINC_FIXED;
+  nc.Init.DestInc                     = DMA_DINC_INCREMENTED;
+  nc.Init.SrcDataWidth                = DMA_SRC_DATAWIDTH_BYTE;
+  nc.Init.DestDataWidth               = DMA_DEST_DATAWIDTH_BYTE;
+  nc.Init.SrcBurstLength              = 1;
+  nc.Init.DestBurstLength             = 1;
+  nc.Init.TransferAllocatedPort       = DMA_SRC_ALLOCATED_PORT0 | DMA_DEST_ALLOCATED_PORT0;
+  nc.Init.TransferEventMode           = DMA_TCEM_BLOCK_TRANSFER;
+  nc.Init.Mode                        = DMA_NORMAL;   /* circular-ness comes from SetCircularMode */
+  nc.TriggerConfig.TriggerPolarity    = DMA_TRIG_POLARITY_MASKED;
+  nc.DataHandlingConfig.DataExchange  = DMA_EXCHANGE_NONE;
+  nc.DataHandlingConfig.DataAlignment = DMA_DATA_RIGHTALIGN_ZEROPADDED;
+  nc.SrcAddress                       = (uint32_t)&huart->Instance->RDR;   /* BIND src = RDR        */
+  nc.DstAddress                       = (uint32_t)buffer;                  /* BIND dst = buffer (FIX)*/
+  nc.DataSize                         = DMA_RX_SIZE;                       /* BIND length            */
+
+  if (HAL_DMAEx_List_BuildNode(&nc, node) != HAL_OK)                        { return HAL_ERROR; }
+  if (HAL_DMAEx_List_InsertNode(list, NULL, node) != HAL_OK)                { return HAL_ERROR; }
+  if (HAL_DMAEx_List_SetCircularMode(list) != HAL_OK)                       { return HAL_ERROR; }
+
+  hdma->Instance                         = channel;
+  hdma->InitLinkedList.Priority          = DMA_LOW_PRIORITY_HIGH_WEIGHT;
+  hdma->InitLinkedList.LinkStepMode      = DMA_LSM_FULL_EXECUTION;
+  hdma->InitLinkedList.LinkAllocatedPort = DMA_LINK_ALLOCATED_PORT0;
+  hdma->InitLinkedList.TransferEventMode = DMA_TCEM_BLOCK_TRANSFER;
+  hdma->InitLinkedList.LinkedListMode    = DMA_LINKEDLIST_CIRCULAR;
+  if (HAL_DMAEx_List_Init(hdma) != HAL_OK)                                  { return HAL_ERROR; }
+  if (HAL_DMAEx_List_LinkQ(hdma, list) != HAL_OK)                           { return HAL_ERROR; }
+
+  __HAL_LINKDMA(huart, hdmarx, *hdma);
+  (void)HAL_DMA_ConfigChannelAttributes(hdma, DMA_CHANNEL_NPRIV);
+
+  /* last_pos for both paths is zero-initialized (.bss) and this runs once at boot. */
+  return HAL_UARTEx_ReceiveToIdle_DMA(huart, buffer, DMA_RX_SIZE);
 }
 
 /* Push a slice into the shared 512KB queue (producer = RX events, ISR context). Full -> drop.
-   All RX ISRs are NVIC priority 0 (serialized), so the only race is vs the main-loop consumer,
-   guarded by this short critical section. */
+   Both RX paths' ISRs are NVIC priority 0 (serialized), so the only race is vs the main-loop
+   consumer, guarded by this short critical section. */
 static void txq_push(const uint8_t *data, uint16_t len)
 {
-  uint16_t i;
   uint32_t primask = __get_PRIMASK();
+  uint32_t space;
+  uint32_t first;
 
   __disable_irq();
-  for (i = 0u; i < len; i++)
+
+  /* On overflow, drop the part that doesn't fit (never overrun the ring). */
+  space = TX_QUEUE_SIZE - txq_count;
+  if ((uint32_t)len > space)
   {
-    if (txq_count >= TX_QUEUE_SIZE)
+    drop_cnt += (uint32_t)len - space;
+    len = (uint16_t)space;
+  }
+
+  if (len != 0u)
+  {
+    /* Bulk copy with at most one wrap; update head/count ONCE (no per-byte loop -> the
+       optimizer can't reuse a counter value as a pointer, which was the bus-fault bug). */
+    first = TX_QUEUE_SIZE - txq_head;
+    if (first > (uint32_t)len)
     {
-      drop_cnt++;
-      continue;
+      first = (uint32_t)len;
     }
-    txq[txq_head] = data[i];
-    txq_head++;
+    memcpy(&txq[txq_head], data, first);
+    if ((uint32_t)len > first)
+    {
+      memcpy(&txq[0], data + first, (uint32_t)len - first);
+    }
+
+    txq_head += len;
     if (txq_head >= TX_QUEUE_SIZE)
     {
-      txq_head = 0u;
+      txq_head -= TX_QUEUE_SIZE;
     }
-    txq_count++;
+    txq_count += len;
   }
+
   __set_PRIMASK(primask);
 }
 
-static uint16_t board1_rx_write_pos(const Board1_RxPath *path)
+/* Copy bytes produced since this path's last event (wrap-aware) into the shared queue.
+   pos = current DMA write position in `buf` [0..DMA_RX_SIZE]. No HAL DMA call here. */
+static void rx_event_drain(const uint8_t *buf, volatile uint16_t *last_pos,
+                           volatile uint32_t *rx_count, uint16_t Size)
 {
-  uint32_t remaining = path->channel->CBR1 & DMA_CBR1_BNDT;
+  uint16_t pos  = (Size > DMA_RX_SIZE) ? DMA_RX_SIZE : Size;   /* clamp: never index OOB */
+  uint16_t last = *last_pos;
 
-  if (remaining > DMA_RX_SIZE)
-  {
-    remaining = DMA_RX_SIZE;
-  }
-  return (uint16_t)(DMA_RX_SIZE - remaining);
-}
-
-/* Copy only bytes produced since the last HT, TC or IDLE event. */
-static void board1_rx_drain(Board1_RxPath *path, uint16_t pos)
-{
-  uint16_t last = *path->last_pos;
-
-  if (pos > DMA_RX_SIZE)
-  {
-    pos = DMA_RX_SIZE;
-  }
   if (pos == last)
   {
     return;
   }
   if (pos > last)
   {
-    *path->rx_count += (uint32_t)(pos - last);
-    txq_push(&path->buffer[last], (uint16_t)(pos - last));
+    *rx_count += (uint32_t)(pos - last);
+    txq_push(&buf[last], (uint16_t)(pos - last));
   }
-  else
+  else                                                          /* wrapped past the end */
   {
-    *path->rx_count += (uint32_t)(DMA_RX_SIZE - last) + pos;
-    txq_push(&path->buffer[last], (uint16_t)(DMA_RX_SIZE - last));
-    if (pos != 0U)
+    *rx_count += (uint32_t)(DMA_RX_SIZE - last) + pos;
+    txq_push(&buf[last], (uint16_t)(DMA_RX_SIZE - last));
+    if (pos > 0u)
     {
-      txq_push(&path->buffer[0], pos);
+      txq_push(&buf[0], pos);
     }
   }
-  *path->last_pos = (pos == DMA_RX_SIZE) ? 0U : pos;
+  *last_pos = (pos >= DMA_RX_SIZE) ? 0u : pos;
 }
 
-static void board1_rx_dma_irq(Board1_RxPath *path)
+/* RX event from a circular DMA (half-transfer / transfer-complete / UART idle). Distinguish the
+   two paths by huart and drain each into the shared queue (merged by arrival order). */
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
-  uint32_t status = path->channel->CSR;
-  uint32_t clear = 0U;
+  if (huart == &hlpuart1)
+  {
+    rx_event_drain(dma_rx_lp, &rx_last_pos_lp, &rx_bytes, Size);
+  }
+  else if (huart == &huart1)
+  {
+    rx_event_drain(dma_rx_u1, &rx_last_pos_u1, &rx_bytes_u1, Size);
+  }
+}
 
-  if ((status & DMA_CSR_HTF) != 0U)
+/* Circular DMA keeps running across UART errors; just count them. No HAL DMA call here. */
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+  if ((huart == &hlpuart1) || (huart == &huart1))
   {
-    clear |= DMA_CFCR_HTF;
-    (*path->ht_count)++;
-    board1_rx_drain(path, DMA_RX_SIZE / 2U);
-  }
-  if ((status & DMA_CSR_TCF) != 0U)
-  {
-    clear |= DMA_CFCR_TCF;
-    (*path->tc_count)++;
-    board1_rx_drain(path, DMA_RX_SIZE);
-  }
-  if ((status & (DMA_CSR_DTEF | DMA_CSR_ULEF | DMA_CSR_USEF | DMA_CSR_TOF)) != 0U)
-  {
-    clear |= DMA_CFCR_DTEF | DMA_CFCR_ULEF | DMA_CFCR_USEF | DMA_CFCR_TOF;
-    (*path->dma_error_count)++;
     err_cnt++;
   }
-  if (clear != 0U)
-  {
-    path->channel->CFCR = clear;
-  }
-}
-
-static void board1_rx_uart_irq(Board1_RxPath *path)
-{
-  uint32_t status = path->uart->ISR;
-  uint32_t clear = 0U;
-
-  if ((status & USART_ISR_IDLE) != 0U)
-  {
-    clear |= USART_ICR_IDLECF;
-  }
-  if ((status & (USART_ISR_PE | USART_ISR_FE | USART_ISR_NE | USART_ISR_ORE)) != 0U)
-  {
-    clear |= USART_ICR_PECF | USART_ICR_FECF | USART_ICR_NECF | USART_ICR_ORECF;
-    err_cnt++;
-  }
-  if (clear != 0U)
-  {
-    path->uart->ICR = clear;
-  }
-  if ((status & USART_ISR_IDLE) != 0U)
-  {
-    (*path->idle_count)++;
-    board1_rx_drain(path, board1_rx_write_pos(path));
-  }
-}
-
-void Board1_Lpuart1DmaIrq(void)
-{
-  board1_rx_dma_irq(&rx_path_lp);
-}
-
-void Board1_Usart1DmaIrq(void)
-{
-  board1_rx_dma_irq(&rx_path_u1);
-}
-
-void Board1_Lpuart1UartIrq(void)
-{
-  board1_rx_uart_irq(&rx_path_lp);
-}
-
-void Board1_Usart1UartIrq(void)
-{
-  board1_rx_uart_irq(&rx_path_u1);
 }
 
 /* Drain the queue to USART3 by writing TDR directly when TXE is set. Non-blocking and
