@@ -107,6 +107,7 @@
   * @}
   */
 
+
 /** @addtogroup STM32U5xx_System_Private_TypesDefinitions
   * @{
   */
@@ -226,6 +227,13 @@ void SystemInit(void)
   #else
     SCB->VTOR = FLASH_BASE | VECT_TAB_OFFSET; /* Vector Table Relocation in Internal FLASH */
   #endif
+
+  /* Stop a circular DMA left active by a debugger/core-only reset before the C runtime clears
+     .bss. Without this early reset, the stale channel can keep writing into RAM during startup. */
+  RCC->AHB1ENR |= RCC_AHB1ENR_GPDMA1EN;
+  (void)RCC->AHB1ENR;
+  RCC->AHB1RSTR |= RCC_AHB1RSTR_GPDMA1RST;
+  RCC->AHB1RSTR &= ~RCC_AHB1RSTR_GPDMA1RST;
 }
 
 /**
@@ -361,4 +369,3 @@ void SystemCoreClockUpdate(void)
 /**
   * @}
   */
-

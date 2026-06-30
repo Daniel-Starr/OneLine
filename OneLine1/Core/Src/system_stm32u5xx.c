@@ -226,6 +226,15 @@ void SystemInit(void)
   #else
     SCB->VTOR = FLASH_BASE | VECT_TAB_OFFSET; /* Vector Table Relocation in Internal FLASH */
   #endif
+
+  /* USER CODE: kill any DMA still running from a previous firmware/run. A debugger reflash or a
+     core-only RST do NOT reset GPDMA; a stray circular DMA can then corrupt RAM while the C
+     runtime zeroes .bss, causing random startup HardFaults. Reset GPDMA1 HERE -- before .bss
+     init -- so every startup is clean. Harmless on a cold/power-on boot (already reset). */
+  RCC->AHB1ENR |= RCC_AHB1ENR_GPDMA1EN;
+  (void)RCC->AHB1ENR;                          /* ensure the clock is up before the reset pulse */
+  RCC->AHB1RSTR |= RCC_AHB1RSTR_GPDMA1RST;
+  RCC->AHB1RSTR &= ~RCC_AHB1RSTR_GPDMA1RST;
 }
 
 /**
