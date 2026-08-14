@@ -1,86 +1,83 @@
-# OneLine 双板串口 DMA 直通桥
+# OneLine 双板串口分帧桥
 
-`master` 分支实现了一个基于 STM32U575 的双板、单向串口透明转发链路。它使用 DMA 接收和 DMA 发送，收到的数据块直接转发，不使用软件 FIFO。
+本分支面向 STM32U575VGTx，实现两路 PC 串口输入经两块开发板汇聚后输出到 PC。当前代码不是透明透传：板 1 为每个接收块添加来源、长度和 CRC，板 2 校验合法性后将完整二进制帧发送给 PC。
 
-当前代码基线：`ac2a4cd`（降低无 FIFO 转发首包延迟）。
-
-## 数据流
+## 数据通路
 
 ```text
-PC 输入
-  │
-  └─> 板 1：LPUART1 RX
-          │  Receive-to-Idle + 循环 RX DMA（256 B）
-          └─> USART3 TX
-                   │  TX DMA（最多 256 B）
-                   └─> 板 2：USART3 RX
-                           │  Receive-to-Idle + 循环 RX DMA（256 B）
-                           └─> LPUART1 TX
-                                    │  TX DMA（最多 256 B）
-                                    └─> PC 输出
+COM10 -> 板1 LPUART1 RX 115200 --\
+                                   +-> 二进制分帧 -> USART3 TX 921600
+COM8  -> 板1 USART1 RX  115200 --/                         |
+                                                              v
+                                      板2 USART3 RX 921600 -> CRC 校验
+                                                              |
+                                                              v
+                                      板2 LPUART1 TX 921600 -> COM7
 ```
 
-板 1 和板 2 的转发逻辑相同，只是 RX/TX 串口角色相反：
-
-| 板卡 | 接收端 | 发送端 |
-| --- | --- | --- |
-| 板 1 | LPUART1 | USART3 |
-| 板 2 | USART3 | LPUART1 |
-
-所有已使用串口均配置为 **115200 bit/s、8 数据位、1 停止位、无校验、无硬件流控**。
-
-## 转发方式
-
-1. `HAL_UARTEx_ReceiveToIdle_DMA()` 启动 256 字节循环 RX DMA。
-2. HAL 在空闲、半传输完成或完整传输完成时调用 `HAL_UARTEx_RxEventCallback()`。
-3. 回调记录循环 DMA 的当前写入位置；`bridge_poll_rx()` 找出尚未转发的连续数据块。
-4. 数据先复制到独立的 `tx_dma_buf`，再通过 `HAL_UART_Transmit_DMA()` 发往下一跳。
-5. TX DMA 完成回调释放 `tx_busy`，并立即继续检查是否已有新的 RX 数据。
-
-该方案的特点是路径短、首包延迟低：数据无需先进入软件队列，CPU 只负责位置管理与把当前块复制到 TX DMA 缓冲区。
-
-## DMA 配置
-
-| 位置 | 方向 | 模式 | 缓冲区 |
+| 板卡 | 接收 | 处理 | 发送 |
 | --- | --- | --- | --- |
-| 板 1 LPUART1 | RX | GPDMA 链表循环 | 256 B |
-| 板 1 USART3 | TX | Normal DMA | 最多 256 B/次 |
-| 板 2 USART3 | RX | GPDMA 链表循环 | 256 B |
-| 板 2 LPUART1 | TX | Normal DMA | 最多 256 B/次 |
+| 板 1 | LPUART1、USART1，各自 1024 B 循环 DMA | 按 RX 事件取出新增数据，封装帧并写入 512 KiB 环形队列 | 主循环轮询 USART3 TXE/TXFNF，直接写 TDR |
+| 板 2 | USART3，1024 B 循环 DMA | 跨 DMA 回调解析帧，校验 SRC、LEN 和 CRC，合法帧整体写入 512 KiB 环形队列 | 主循环轮询 LPUART1 TXE/TXFNF，直接写 TDR |
 
-STM32U575 使用 Cortex-M33；本工程的缓冲区可由 DMA 直接访问，当前实现不需要额外的 D-Cache 维护。
+RX 使用 `HAL_UARTEx_ReceiveToIdle_DMA()`，通过半传输、全传输和空闲事件持续搬运数据。UART 出错后，回调只设置重启标志，主循环限速重建对应 DMA。
 
-## 调试计数器
+## 帧格式
 
-每块板的 `main.c` 都提供以下 `volatile` 计数器，适合在 Keil Watch 窗口观察：
+```text
+[0xAA][SRC][LEN_H][LEN_L][PAYLOAD...][CRC8]
+```
 
-- `rx_bytes`：从 RX DMA 取出的字节数。
-- `tx_bytes`：TX DMA 已成功完成的字节数。
-- `err_cnt`：接收或发送错误次数。
-- `zero_burst_cnt` / `zero_drop_bytes`：被判定为全 `0x00` 的噪声块及其字节数。
-- `rx_event_idle_cnt` / `rx_event_ht_cnt` / `rx_event_tc_cnt`：Receive-to-Idle 的事件分布。
-- `tx_busy`：当前是否仍有一笔 TX DMA 在执行。
+- `SRC = 0x01`：板 1 LPUART1（COM10）。
+- `SRC = 0x02`：板 1 USART1（COM8）。
+- `LEN`：大端序，范围 1..1024，只表示 `PAYLOAD` 长度。
+- `CRC8`：CRC-8/ATM，多项式 `0x07`，初值 `0x00`，覆盖 `SRC + LEN_H + LEN_L + PAYLOAD`。
+- 板 2 校验通过后发送的是完整帧，COM7 端需要按上述格式解析；不会自动剥离帧头和 CRC。
+
+## 工程结构
+
+| 路径 | 说明 |
+| --- | --- |
+| `OneLine1/` | 板 1 的 STM32CubeMX / Keil 工程 |
+| `OneLine2/` | 板 2 的 STM32CubeMX / Keil 工程 |
+| `OneLine1/Core/Src/main.c` | 双路接收、分帧、发送队列和错误恢复 |
+| `OneLine2/Core/Src/main.c` | 单路接收、帧解析/CRC 校验、发送队列和错误恢复 |
+| `docs/superpowers/` | 历史设计与实施记录；部分文档描述旧方案，以当前源码为准 |
+| `tools/test-board1-rx-architecture.ps1` | 旧架构静态检查脚本，目前尚未同步到最新实现 |
+
+## 可观测变量
+
+板 1 主要变量：
+
+- `rx_bytes`、`rx_bytes_u1`、`tx_bytes`
+- `drop_cnt`、`frame_drop_cnt`、`err_cnt`
+- `rearm_lp_cnt`、`rearm_u1_cnt` 及对应失败计数
+- `main_loop_cnt`、`rx_start_stage`
+
+板 2 主要变量：
+
+- `rx_bytes`、`tx_bytes`、`drop_cnt`、`err_cnt`
+- `frame_ok_cnt`、`frame_crc_err_cnt`、`frame_fmt_err_cnt`、`frame_drop_cnt`
+- `noise_drop_bytes`、`rearm_rx_cnt`、`rearm_rx_fail_cnt`
 
 ## 已知边界
 
-- 本分支 **没有软件 FIFO**。`tx_busy` 为真时，转发函数会先返回；如果接收端在发送端追上前绕过 256 字节循环缓冲区，早期数据可能被覆盖。
-- `drop_cnt` 虽已声明，但当前实现没有在上述无缓冲覆盖场景中递增；因此它不能用于证明链路无丢包。
-- 接收 DMA 使用循环链表，错误回调会中止并重新启动接收 DMA。应通过实际硬件长时间运行验证异常恢复与循环回绕稳定性。
-- 无协议帧、CRC、ACK/重传或 RTS/CTS 流控；它是透明字节转发，不是可靠传输协议。
-- `DROP_ALL_ZERO_RX_CHUNKS` 默认开启，用于抑制 RX 悬空或被拉低时的 `0x00` 噪声；若业务允许真实的全零报文，应重新评估该开关。
+- 512 KiB 队列用于吸收突发，不等于端到端可靠传输；队列满时会整帧或按代码路径丢弃并计数。
+- UART 错误恢复会重置 DMA 消费位置；错误窗口内未处理的数据可能丢失。
+- 独立看门狗只在收到真实 RX 事件时喂狗；任一板超过约 1.1 秒没有数据会主动复位。这是当前代码行为，部署前应确认是否符合产品需求。
+- `.ioc` 仍保留部分未参与当前数据通路的 DMA/UART 配置；重新生成 CubeMX 代码前应核对源码与配置的一致性。
+- 历史提交曾多次出现 DMA 回绕和重启相关 HardFault。软件构建成功不能替代真实硬件上的长时间双路压力、断线恢复和数据完整性验证。
 
-## 建议验证
+## 构建与验证
 
-1. 使用短报文确认 PC 输入能够稳定到达板 2 的 PC 输出。
-2. 测试 1、128、256 字节及跨 256 字节边界的报文，核对接收总字节数与 `tx_bytes`。
-3. 进行持续发送和长时间运行，监控 `err_cnt`、事件计数及是否发生 HardFault。
-4. 故意制造 RX 断开、悬空与过载，观察全零过滤、DMA 重启和数据完整性。
+分别使用 Keil µVision 打开并构建：
 
-## 与 `NormalDMA` 分支的区别
+- `OneLine1/MDK-ARM/OneLine1.uvprojx`
+- `OneLine2/MDK-ARM/OneLine2.uvprojx`
 
-| 分支 | 输入结构 | 接收 | 缓冲 | 发送 |
-| --- | --- | --- | --- | --- |
-| `master` | 单路输入 | 循环 DMA | 无软件 FIFO | TX DMA 直发 |
-| `NormalDMA` | 板 1 双路输入汇聚 | 单次 Normal DMA | 4 KiB 软件 FIFO | 带超时的阻塞发送 |
+建议至少验证：
 
-`master` 适合作为低延迟的单路 DMA 直通基线；`NormalDMA` 则侧重多输入汇聚和更显式的背压/丢包观测。两者的可靠性和性能应分别在目标硬件上测试后再用于正式发布。
+1. COM8、COM10 单路短报文与跨 1024 B 边界报文。
+2. 双路同时持续发送，按 `SRC` 分流后检查各路顺序和 CRC。
+3. 连续运行、插拔串口及错误恢复，确认无 HardFault 且所有丢弃/错误计数符合预期。
+4. COM7 解析后的载荷总数与板 1 两路接收计数对应一致。
