@@ -1,57 +1,83 @@
-# OneLine
+# OneLine 双板串口分帧桥
 
-**OneLine 桥接 · 纯寄存器轮询方案（没有 DMA）**
-
-一个透明、单向的双板 UART 桥：PC 的串口数据经过两块 STM32U575VGTx（Cortex‑M33）板子中转后**原样**回到 PC，全程**逐字节透传**——不加帧头、不加 CRC、不加端口号、不用 printf。
+本分支面向 STM32U575VGTx，实现两路 PC 串口输入经两块开发板汇聚后输出到 PC。当前代码不是透明透传：板 1 为每个接收块添加来源、长度和 CRC，板 2 校验合法性后将完整二进制帧发送给 PC。
 
 ## 数据通路
 
-```
-PC ──▶ 板1 LPUART1_RX (PC0)  ┐
-                             ├─ 合并 ─▶ 板1 USART3_TX (PA7)
-PC ──▶ 板1 USART1_RX (PA10) ┘                  │
-                                               ▼ (PA7 → PA5)
-PC ◀── 板2 LPUART1_TX (PC1) ◀── 板2 USART3_RX (PA5)
-```
-
-- **板1（二合一）**：两路输入 `LPUART1_RX` + `USART1_RX` 合并 → 一路输出 `USART3_TX`
-- **板2（中继）**：单路 `USART3_RX` → `LPUART1_TX` 吐回 PC
-- 全链路 115200 / 8N1
-
-## 方案：纯寄存器轮询
-
-整条数据通路**不用 DMA、不用中断、不用 HAL 的 UART 运行时、不用句柄/回调**。只有一个软件环形 FIFO + 主循环轮询寄存器：
-
-```c
-while (1) {
-    rx_poll();   // RXNE 置位?      -> 读 RDR -> 入 4096B FIFO
-    tx_kick();   // TXE 置位且非空? -> 取一字节 -> 写 TDR
-}
+```text
+COM10 -> 板1 LPUART1 RX 115200 --\
+                                   +-> 二进制分帧 -> USART3 TX 921600
+COM8  -> 板1 USART1 RX  115200 --/                         |
+                                                              v
+                                      板2 USART3 RX 921600 -> CRC 校验
+                                                              |
+                                                              v
+                                      板2 LPUART1 TX 921600 -> COM7
 ```
 
-- `rx_poll()`：轮询每个 RX 串口的 `RXNE`，直接从 `RDR` 读字节塞进 FIFO（顺带清 `ORE` 防卡）
-- `tx_kick()`：轮询 TX 串口的 `TXE`，从 FIFO 取一个字节写 `TDR`
-- 收发都在主循环里跑，没有中断碰 FIFO → **无竞态、无临界区、无锁**
+| 板卡 | 接收 | 处理 | 发送 |
+| --- | --- | --- | --- |
+| 板 1 | LPUART1、USART1，各自 1024 B 循环 DMA | 按 RX 事件取出新增数据，封装帧并写入 512 KiB 环形队列 | 主循环轮询 USART3 TXE/TXFNF，直接写 TDR |
+| 板 2 | USART3，1024 B 循环 DMA | 跨 DMA 回调解析帧，校验 SRC、LEN 和 CRC，合法帧整体写入 512 KiB 环形队列 | 主循环轮询 LPUART1 TXE/TXFNF，直接写 TDR |
 
-## 为什么是纯轮询（不用 DMA）
+RX 使用 `HAL_UARTEx_ReceiveToIdle_DMA()`，通过半传输、全传输和空闲事件持续搬运数据。UART 出错后，回调只设置重启标志，主循环限速重建对应 DMA。
 
-DMA 在这颗 U5 上反复把内存写坏、导致 **HardFault**，依次踩过三个坑：
+## 帧格式
 
-| # | 故障 | 现象 |
-|---|------|------|
-| 1 | 环形链表 DMA 越界 | CubeMX 的 circular 节点没绑定目的地址，回绕时写花 RAM（`CFSR=0x8200`） |
-| 2 | DMA‑TX 空句柄 | `HAL_UART_Transmit_DMA` 解引用被写坏的 `hdmatx`（`BFAR=0x30`） |
-| 3 | DMA‑RX 坏返回地址 | `UART_Start_Receive_DMA` 路径里返回地址 Thumb 位被清、跳飞（`CFSR=0x00010000` UNDEFINSTR） |
+```text
+[0xAA][SRC][LEN_H][LEN_L][PAYLOAD...][CRC8]
+```
 
-纯轮询的数据通路里**没有任何可被写坏的指针**，所以这一整类故障在结构上消失了。160 MHz 的核在 115200 下每个字节有 87 µs，主循环每字节能轮询上千次 → 单路不丢字节。（板1 两路同时满速时输入 > 输出，FIFO 会溢出丢字节并计入 `drop_cnt`，属预期行为。）
+- `SRC = 0x01`：板 1 LPUART1（COM10）。
+- `SRC = 0x02`：板 1 USART1（COM8）。
+- `LEN`：大端序，范围 1..1024，只表示 `PAYLOAD` 长度。
+- `CRC8`：CRC-8/ATM，多项式 `0x07`，初值 `0x00`，覆盖 `SRC + LEN_H + LEN_L + PAYLOAD`。
+- 板 2 校验通过后发送的是完整帧，COM7 端需要按上述格式解析；不会自动剥离帧头和 CRC。
 
 ## 工程结构
 
 | 路径 | 说明 |
-|------|------|
-| `OneLine1/` | 板1（二合一）Keil / CubeMX 工程 |
-| `OneLine2/` | 板2（中继）Keil / CubeMX 工程 |
-| `Core/Src/main.c` | 应用逻辑（全部在各自的 USER CODE 区内） |
+| --- | --- |
+| `OneLine1/` | 板 1 的 STM32CubeMX / Keil 工程 |
+| `OneLine2/` | 板 2 的 STM32CubeMX / Keil 工程 |
+| `OneLine1/Core/Src/main.c` | 双路接收、分帧、发送队列和错误恢复 |
+| `OneLine2/Core/Src/main.c` | 单路接收、帧解析/CRC 校验、发送队列和错误恢复 |
+| `docs/superpowers/` | 历史设计与实施记录；部分文档描述旧方案，以当前源码为准 |
+| `tools/test-board1-rx-architecture.ps1` | 旧架构静态检查脚本，目前尚未同步到最新实现 |
 
-- 用 Keil μVision 编译，两个工程均 **0 Error / 0 Warning**
-- DMA 通道虽仍由 CubeMX 配置但**未使用**（数据通路已全部走寄存器轮询）
+## 可观测变量
+
+板 1 主要变量：
+
+- `rx_bytes`、`rx_bytes_u1`、`tx_bytes`
+- `drop_cnt`、`frame_drop_cnt`、`err_cnt`
+- `rearm_lp_cnt`、`rearm_u1_cnt` 及对应失败计数
+- `main_loop_cnt`、`rx_start_stage`
+
+板 2 主要变量：
+
+- `rx_bytes`、`tx_bytes`、`drop_cnt`、`err_cnt`
+- `frame_ok_cnt`、`frame_crc_err_cnt`、`frame_fmt_err_cnt`、`frame_drop_cnt`
+- `noise_drop_bytes`、`rearm_rx_cnt`、`rearm_rx_fail_cnt`
+
+## 已知边界
+
+- 512 KiB 队列用于吸收突发，不等于端到端可靠传输；队列满时会整帧或按代码路径丢弃并计数。
+- UART 错误恢复会重置 DMA 消费位置；错误窗口内未处理的数据可能丢失。
+- 独立看门狗只在收到真实 RX 事件时喂狗；任一板超过约 1.1 秒没有数据会主动复位。这是当前代码行为，部署前应确认是否符合产品需求。
+- `.ioc` 仍保留部分未参与当前数据通路的 DMA/UART 配置；重新生成 CubeMX 代码前应核对源码与配置的一致性。
+- 历史提交曾多次出现 DMA 回绕和重启相关 HardFault。软件构建成功不能替代真实硬件上的长时间双路压力、断线恢复和数据完整性验证。
+
+## 构建与验证
+
+分别使用 Keil µVision 打开并构建：
+
+- `OneLine1/MDK-ARM/OneLine1.uvprojx`
+- `OneLine2/MDK-ARM/OneLine2.uvprojx`
+
+建议至少验证：
+
+1. COM8、COM10 单路短报文与跨 1024 B 边界报文。
+2. 双路同时持续发送，按 `SRC` 分流后检查各路顺序和 CRC。
+3. 连续运行、插拔串口及错误恢复，确认无 HardFault 且所有丢弃/错误计数符合预期。
+4. COM7 解析后的载荷总数与板 1 两路接收计数对应一致。
